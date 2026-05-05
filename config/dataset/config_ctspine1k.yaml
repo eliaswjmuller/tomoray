@@ -1,0 +1,26 @@
+numTrain: 4
+numVal: 0
+
+DSD: 1500.0
+DSO: 1000.0
+
+nDetector: [400, 400]
+dDetector: [1.0, 1.0]
+
+nVoxel: [128, 128, 128]
+dVoxel: [3.125, 3.125, 3.125]
+
+offOrigin: [0.0, 0.0, 0.0]
+offDetector: [0.0, 0.0]
+
+accuracy: 0.5
+mode: parallel
+filter: null
+
+totalAngle: 120
+startAngle: 0.0
+randomAngle: False
+
+convert: False
+normalize: False
+noise: 0
