@@ -23,13 +23,13 @@ def run(cfg: DictConfig):
     process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=3600))
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
-        mixed_precision="bf16" if cfg.model.amp else "no",
+        mixed_precision="bf16" if cfg.model.amp and torch.cuda.is_available() else "no",
         gradient_accumulation_steps=cfg.model.gradient_accumulate_every,
         kwargs_handlers=[process_group_kwargs, ddp_kwargs]
     )
     if accelerator.is_main_process:
         effective_batch_size = cfg.model.batch_size * accelerator.num_processes * cfg.model.gradient_accumulate_every
-        print(f"Distributed training initialized on {accelerator.num_processes} GPUs.")
+        print(f"Distributed training initialized on {accelerator.num_processes} processes ({accelerator.device}).")
         print(f"Batch size per gpu : {cfg.model.batch_size}")
         print(f"Gradient accumulation : {cfg.model.gradient_accumulate_every}")
         print(f"Effective batch size : {effective_batch_size}")

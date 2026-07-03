@@ -14,7 +14,7 @@ from torch.utils import data
 from pathlib import Path
 from torch.optim import Adam
 from torchvision import transforms as T, utils
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from PIL import Image
 
 from tqdm import tqdm
@@ -677,9 +677,9 @@ class GaussianDiffusion(nn.Module):
         self.denoise_fn = denoise_fn
 
         if vqgan_ckpt:
-            self.vqgan = VQGAN.load_from_checkpoint(vqgan_ckpt, weights_only=False).cuda()
+            self.vqgan = VQGAN.load_from_checkpoint(vqgan_ckpt, weights_only=False)
             self.vqgan.eval()
-        
+
         else:
             self.vqgan = None
         
@@ -974,7 +974,14 @@ class Trainer(object):
 
         self.accelerator = accelerator
         self.is_main = self.accelerator.is_main_process if self.accelerator else True
-        self.device = self.accelerator.device if self.accelerator else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.accelerator:
+            self.device = self.accelerator.device
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
 
         self.model = diffusion_model
         self.fusion_model = fusion_model
@@ -1051,7 +1058,7 @@ class Trainer(object):
 
         self.val_dl = val_dl
         self.test_dl = test_dl
-        self.metrics = Metrics(results_folder, val_dl)
+        self.metrics = Metrics(results_folder, val_dl, device=self.device)
 
         if self.debug_overfit:
             print("Debug mode:")
@@ -1071,8 +1078,8 @@ class Trainer(object):
         
         self.step = 0
 
-        self.amp = amp
-        self.scaler = GradScaler(enabled=amp)
+        self.amp = amp and self.device.type == "cuda"
+        self.scaler = GradScaler(self.device.type, enabled=self.amp)
         self.max_grad_norm = max_grad_norm
 
         self.num_sample_rows = num_sample_rows
@@ -1120,11 +1127,16 @@ class Trainer(object):
                 all_milestones) > 0, 'need to have at least one milestone to load from latest checkpoint (milestone == -1)'
             milestone = max(all_milestones)
 
-        if map_location:
-            data = torch.load(milestone, map_location=map_location)
+        if map_location is None:
+            map_location = self.device
+
+        if isinstance(milestone, str) or isinstance(milestone, Path):
+            ckpt_path = milestone
         else:
-            print('found checkpoint', os.path.join(self.results_folder, 'checkpoints', f"sample-{milestone}.pt"))
-            data = torch.load(os.path.join(self.results_folder, 'checkpoints', f"sample-{milestone}.pt"))
+            ckpt_path = os.path.join(self.results_folder, 'checkpoints', f"sample-{milestone}.pt")
+
+        print('found checkpoint', ckpt_path)
+        data = torch.load(ckpt_path, map_location=map_location)
 
         self.step = data['step']
 
@@ -1188,7 +1200,7 @@ class Trainer(object):
                 xrays = batch['projections'].to(self.device)
                 angles = batch['angles'].to(self.device)
 
-                with autocast(enabled=self.amp):
+                with autocast(self.device.type, enabled=self.amp):
                     
                     cond = self.fusion_model(xrays, angles)
 
@@ -1276,7 +1288,7 @@ class Trainer(object):
                         val_xrays = val_batch["projections"].to(self.device)
                         val_angles = val_batch["angles"].to(self.device)
 
-                        with autocast(enabled=self.amp):
+                        with autocast(self.device.type, enabled=self.amp):
                             val_cond = self.fusion_model(val_xrays, val_angles)
                             val_loss = self.ema_model(
                                 val_img,
@@ -1405,7 +1417,7 @@ class Trainer(object):
             test_xrays = test_batch["projections"].to(self.device)
             test_angles = test_batch["angles"].to(self.device)
 
-            with autocast(enabled=self.amp):
+            with autocast(self.device.type, enabled=self.amp):
                 test_cond = self.fusion_model(test_xrays, test_angles)
                 
                 test_loss = self.ema_model(

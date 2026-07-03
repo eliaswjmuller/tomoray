@@ -1,0 +1,33 @@
+numTrain: 4
+numVal: 0
+
+# DSD/DSO (mm) OMITTED: RSNA strips DistanceSourceTo{Detector,Patient}, so
+# neither CSV override nor a default can recover truth. Set explicitly per
+# experiment (Hydra override). Pipeline KeyErrors if missing — intentional.
+#   DSD: 1085.6   # e.g. Siemens SOMATOM brain protocol — VERIFY
+#   DSO:  595.0
+
+nDetector: [400, 400]
+dDetector: [0.8, 0.8]   # detector pixel pitch (mm) — gives ~320mm detector
+
+nVoxel: [128, 128, 128]
+dVoxel: [2.0, 2.0, 2.0]   # ~256mm FOV for head
+
+offOrigin: [0.0, 0.0, 0.0]
+offDetector: [0.0, 0.0]
+
+accuracy: 0.5
+mode: cone
+filter: null
+
+totalAngle: 180
+startAngle: 0.0
+randomAngle: False
+
+convert: True       # convert HU to linear attenuation coefficients for realistic DRRs
+normalize: False
+noise: 0
+
+# clip_hu OMITTED: clipping is a downstream concern; preserve full HU range
+# so DRRs see bone. generate_all.py treats missing clip_hu as no-clip.
+# clip_hu: [-100, 300]   # previous default — brain display window

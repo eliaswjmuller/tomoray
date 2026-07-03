@@ -27,7 +27,7 @@ def create_window(window_size, channel=1):
     return window
 
 class Metrics:
-    def __init__(self, path, val_dl):
+    def __init__(self, path, val_dl, device=None):
 
         self.val_dl = val_dl
         self.root_dir = path
@@ -43,14 +43,23 @@ class Metrics:
         Path(self.path_to_save_PSNR).mkdir(parents=True, exist_ok=True)
         Path(self.path_to_save_RMSE).mkdir(parents=True, exist_ok=True)
 
-        self.loss_lpips = lpips.LPIPS(net='vgg').cuda()
+        if device is None:
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
+        self.device = device
+
+        self.loss_lpips = lpips.LPIPS(net='vgg').to(self.device)
 
 
     def process_input(self, data):
 
-        img = data["image"].cuda().float()
-        xrays = data["projections"].cuda().float()
-        angles = data["angles"].cuda().float()
+        img = data["image"].to(self.device).float()
+        xrays = data["projections"].to(self.device).float()
+        angles = data["angles"].to(self.device).float()
 
         return img, xrays, angles
 

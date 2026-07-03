@@ -128,7 +128,7 @@ class VQGAN(pl.LightningModule):
 
     def forward(self, x, optimizer_idx=None, log_image=False, evaluation=False):
 
-        x = x.cuda()
+        device = x.device
         # ([1, 1, 128, 128, 128])
         B, C, D, H, W = x.shape
 
@@ -139,10 +139,9 @@ class VQGAN(pl.LightningModule):
 
         recon_loss = F.l1_loss(x_recon, x) * self.l1_weight
 
-        #frame_idx = torch.randint(0, D, [B]).cuda()
         # Selects ALWAYS the middle slice
-        frame_idx = torch.full([B], D // 2).long().cuda()
-        frame_idx_selected = frame_idx.reshape(-1, 1, 1, 1, 1).repeat(1, C, 1, H, W).cuda()
+        frame_idx = torch.full([B], D // 2, device=device).long()
+        frame_idx_selected = frame_idx.reshape(-1, 1, 1, 1, 1).repeat(1, C, 1, H, W)
         frames = torch.gather(x, 2, frame_idx_selected).squeeze(2)
         frames_recon = torch.gather(x_recon, 2, frame_idx_selected).squeeze(2)
 

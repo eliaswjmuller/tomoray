@@ -5,6 +5,7 @@ import pickle
 import yaml
 import numpy as np
 import nibabel as nib
+import nibabel.processing
 import scipy.ndimage.interpolation
 import tigre
 from tigre.utilities.geometry import Geometry as TigreGeometry
@@ -34,13 +35,20 @@ def config_parser():
                         choices=["auto", "none", "x", "y", "z"],
                         help="Reflection fix mode (based on det_internal).")
 
+    parser.add_argument("--metadataCsv", default=None, type=str,
+                        help="Path to metadata CSV (from rsna_indexing.py). "
+                             "If provided, DSD/DSO are read per-volume from the CSV.")
+
     return parser
 
 
 def nifti_to_internal_xyz(path_nii: str, orientation: str):
     img = nib.load(path_nii)
 
-    img_ras = nib.as_closest_canonical(img)
+    # LOSSY: reorient to RAS and undo gantry tilt in one trilinear pass.
+    # No-op for axis-aligned scans (identity transform); ~10-25° tilt common
+    # on RSNA brain CT. Required: TIGRE assumes axis-aligned voxels.
+    img_ras = nib.processing.resample_to_output(img, order=1)
     data_ras = img_ras.get_fdata(dtype=np.float32)
     ax_ras = nib.aff2axcodes(img_ras.affine)
 
@@ -157,9 +165,12 @@ def generator_one(matPath: str, config_data: dict, outputPath: str,
 
     data_xyz, meta = nifti_to_internal_xyz(matPath, orientation)
 
-    min_hu, max_hu = -300, 1000
-    
-    image_ori = np.clip(data_xyz, min_hu, max_hu).astype(np.float32)
+    # clip_hu is optional: applied if set (CTSpine1K/VerSe), passthrough if not (RSNA).
+    clip_hu = data.get("clip_hu", None)
+    if clip_hu is not None:
+        image_ori = np.clip(data_xyz, clip_hu[0], clip_hu[1]).astype(np.float32)
+    else:
+        image_ori = data_xyz.astype(np.float32)
 
     if data.get("convert", False):
         image = convert_to_attenuation(image_ori, 1.0, 0.0)
@@ -207,7 +218,7 @@ def generator_one(matPath: str, config_data: dict, outputPath: str,
         "image_axis_order": "XYZ",
         "tigre_volume_axis_order": "ZYX",
         "image_matches_projections": True,
-        "clip_hu": [min_hu, max_hu],
+        "clip_hu": list(clip_hu) if clip_hu is not None else None,
         "did_convert_to_attenuation": bool(data.get("convert", False)),
         "did_normalize_0_1": bool(data.get("normalize", False)),
     }
@@ -251,6 +262,30 @@ def safe_stem(path: str) -> str:
     return osp.splitext(base)[0]
 
 
+def load_geometry_lookup(metadata_csv):
+    """series_uid -> {DSD, DSO} from first slice per series. Warns if empty
+    (e.g. RSNA strips these tags — override is a no-op, YAML values win)."""
+    import pandas as pd_local
+    df = pd_local.read_csv(metadata_csv)
+    geo_cols = ['dist_source_to_detector', 'dist_source_to_patient']
+    missing = [c for c in geo_cols if c not in df.columns]
+    if missing:
+        print(f"WARNING: {metadata_csv} missing {missing}; geometry override disabled.")
+        return {}
+    first_per_series = df.groupby('series_uid').first()[geo_cols]
+    geo = first_per_series.to_dict(orient='index')
+
+    def _present(v):
+        return v is not None and not (isinstance(v, float) and np.isnan(v))
+    n = len(geo)
+    n_dsd = sum(1 for v in geo.values() if _present(v['dist_source_to_detector']))
+    n_dso = sum(1 for v in geo.values() if _present(v['dist_source_to_patient']))
+    print(f"Geometry lookup: {n} series; DSD {n_dsd}/{n}, DSO {n_dso}/{n}.")
+    if n > 0 and n_dsd == 0 and n_dso == 0:
+        print("WARNING: no DSD/DSO in CSV (RSNA-anonymized?); YAML values used.")
+    return geo
+
+
 def main():
     args = config_parser().parse_args()
 
@@ -262,6 +297,14 @@ def main():
     # Load shared config once
     with open(args.configPath, "r") as handle:
         config_data = yaml.safe_load(handle)
+
+    # Load per-volume geometry if metadata CSV is provided
+    geo_lookup = None
+    if args.metadataCsv:
+        if not os.path.exists(args.metadataCsv):
+            raise FileNotFoundError(f"metadataCsv does not exist: {args.metadataCsv}")
+        geo_lookup = load_geometry_lookup(args.metadataCsv)
+        print(f"Loaded per-volume geometry for {len(geo_lookup)} series from {args.metadataCsv}")
 
     files = list_nifti_files(args.inputDir, args.exts, args.recursive)
     if len(files) == 0:
@@ -279,10 +322,20 @@ def main():
         out_name = f"{stem}{args.outputSuffix}.pickle"
         out_path = osp.join(args.outputFolder, out_name)
 
+        # Override DSD/DSO from metadata if available
+        # NIfTI filename stem == series_uid (from reconstruction step)
+        per_volume_config = dict(config_data)
+        if geo_lookup and stem in geo_lookup:
+            geo = geo_lookup[stem]
+            if geo['dist_source_to_detector'] is not None:
+                per_volume_config['DSD'] = geo['dist_source_to_detector']
+            if geo['dist_source_to_patient'] is not None:
+                per_volume_config['DSO'] = geo['dist_source_to_patient']
+
         try:
             generator_one(
                 matPath=path,
-                config_data=config_data,
+                config_data=per_volume_config,
                 outputPath=out_path,
                 orientation=args.orientation,
                 fix_reflection=args.fix_reflection,

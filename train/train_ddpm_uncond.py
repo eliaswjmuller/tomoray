@@ -15,11 +15,15 @@ from get_dataset import get_dataset
 def run(cfg: DictConfig):
 
     if torch.cuda.is_available():
-
-        torch.cuda.set_device(cfg.model.gpus)
+        device = torch.device(f"cuda:{cfg.model.gpus}")
+        torch.cuda.set_device(device)
         print(f"Device is set to GPU:{cfg.model.gpus}")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Device is set to MPS")
     else:
-        print("Cuda is not available")
+        device = torch.device("cpu")
+        print("Device is set to CPU")
 
     with open_dict(cfg):
         cfg.model.results_folder = os.path.join(
@@ -42,7 +46,7 @@ def run(cfg: DictConfig):
         dim_mults=cfg.model.dim_mults,
         channels=latent_channels,
         cond_channels=0
-    ).cuda()
+    ).to(device)
 
     print("Initialization of diffusion")
 
@@ -55,7 +59,7 @@ def run(cfg: DictConfig):
         timesteps=cfg.model.timesteps,
         loss_type='l2'
 
-    ).cuda()
+    ).to(device)
 
 
 
