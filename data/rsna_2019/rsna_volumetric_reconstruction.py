@@ -7,22 +7,35 @@ per series via SimpleITK, and emits reconstruction_manifest.csv.
 Permissive by design — reconstruct everything reconstructable; record
 flags; defer filtering downstream.
 
+The CSV stores .dcm names. If only ID_*.dcm.gz is on disk (SimpleITK
+cannot read gzip), the series is decompressed into a temp dir under
+--output_dir/.staging and deleted right after; peak extra disk is
+n_workers × one series.
+
 Skips: mixed IOP across slices, n_slices < --min_slices (default 2).
 Reconstructs but flags: duplicate z (deduped, has_duplicate_z), non-uniform
-dz (dz_uniform=False), gantry tilt (preserved in NIfTI direction matrix;
-resample-to-axial is lossy and happens downstream in data/generate_all.py
-via resample_to_output).
+dz (dz_uniform=False), gantry tilt (57% of RSNA, median 19°).
 
-clean_subset.csv (alongside manifest): manifest filtered to status in
-{reconstructed, exists}, dz_uniform, no duplicate/mixed flags,
-gantry_tilt_deg < --clean_tilt_thresh (default 1.0°). Retunable without
-re-reconstructing.
+Volumes are written in an axial frame (identity direction cosines). Tilt is
+NOT corrected: de-shearing would cost a trilinear resample along the 5 mm
+axis, and NIfTI cannot store the true sheared affine anyway. So a tilted
+series lands on disk as its raw, uninterpolated slice stack, carrying a
+sheared head — real anatomy under an affine, self-consistent with any DRR
+taken from it. See _force_axial_frame.
+
+Two subsets are emitted alongside the manifest, for the tilt ablation:
+clean_subset.csv (axial only, gantry_tilt_deg < --clean_tilt_thresh,
+default 1.0°) and clean_subset_with_tilt.csv (adds the tilted series).
+Both retunable without re-reconstructing.
 
 Required CLI: --metadata_csv, --dcm_dir, --output_dir.
 """
 
 import argparse
+import gzip
 import os
+import shutil
+import tempfile
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Any
@@ -129,30 +142,82 @@ def _sort_along_normal(series_df):
 
 
 def write_clean_subset(manifest, manifest_path: Path, tilt_thresh: float = 1.0):
-    """Filter manifest -> clean_subset.csv. Clean iff status in
-    {reconstructed, exists}, dz_uniform, no duplicates / mixed spacing / mixed
-    shape, and tilt < tilt_thresh. NaN flags are permissive."""
+    """Filter manifest -> two subsets, the ablation pair:
+
+      clean_subset.csv           axial only (gantry_tilt_deg < tilt_thresh)
+      clean_subset_with_tilt.csv same, plus the tilted series
+
+    Both require status in {reconstructed, exists}, dz_uniform, and no duplicate
+    / mixed-spacing / mixed-shape flags. NaN flags are permissive. Tilted volumes
+    carry a sheared head (see _force_axial_frame) — real anatomy under an affine,
+    not corrupted data, but a distribution shift. Retunable without re-running."""
     has_volume = manifest["status"].isin(["reconstructed", "exists"])
-    clean = manifest[
+    base = (
         has_volume
         & manifest["dz_uniform"].eq(True)
         & ~manifest["has_duplicate_z"].eq(True)
         & ~manifest["has_mixed_pixel_spacing"].eq(True)
         & ~manifest["has_mixed_rows_cols"].eq(True)
-        & (manifest["gantry_tilt_deg"].fillna(0.0) < tilt_thresh)
-    ].copy()
-    out_path = manifest_path.with_name("clean_subset.csv")
-    clean.to_csv(out_path, index=False)
-    print(f"Clean subset: {len(clean)}/{int(has_volume.sum())} reconstructed "
-          f"series pass the cleanliness filter (tilt < {tilt_thresh}°). "
-          f"Wrote {out_path}.")
+    )
+    axial = manifest["gantry_tilt_deg"].fillna(0.0) < tilt_thresh
+
+    clean = manifest[base & axial].copy()
+    with_tilt = manifest[base].copy()
+
+    clean_path = manifest_path.with_name("clean_subset.csv")
+    tilt_path = manifest_path.with_name("clean_subset_with_tilt.csv")
+    clean.to_csv(clean_path, index=False)
+    with_tilt.to_csv(tilt_path, index=False)
+
+    print(f"Clean subsets ({int(has_volume.sum())} reconstructed series):")
+    print(f"  axial only (tilt < {tilt_thresh}°): {len(clean):>6}  -> {clean_path}")
+    print(f"  + tilted series:                    {len(with_tilt):>6}  -> {tilt_path}")
     return clean
+
+
+def _force_axial_frame(image):
+    """Stamp an identity direction on the volume, in place.
+
+    ITK stacks the slices along the *slice normal*, but a tilted RSNA scan steps
+    the table along +z — so for the 57% of series with gantry tilt, ITK's third
+    direction cosine is not the axis the slices were actually acquired along, and
+    the volume lands on disk claiming a rotated-slab geometry. The true geometry
+    is a shear, which NIfTI cannot store (ITK coerces non-orthogonal directions to
+    orthogonal on write).
+
+    Declaring the stack axial keeps the voxel array exactly as acquired — no
+    interpolation — and leaves the tilt as a shear of the anatomy. Downstream
+    resample_to_output then becomes a no-op instead of a rotation + resample.
+    ITK's z-spacing is already the true IPP step, so only the cosines change.
+    For an untilted series this is a no-op.
+    """
+    image.SetDirection((1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+    return image
+
+
+def _stage_series(dcm_dir: Path, filenames, tmpdir: str) -> list[str]:
+    """Readable paths for a series' slices. Uses the .dcm in place when present,
+    otherwise decompresses its .dcm.gz into tmpdir (SimpleITK can't read gzip)."""
+    paths = []
+    for fname in filenames:
+        plain = dcm_dir / fname
+        if plain.exists():
+            paths.append(str(plain))
+            continue
+        gz = dcm_dir / f"{fname}.gz"
+        if not gz.exists():
+            raise FileNotFoundError(f"neither {fname} nor {fname}.gz in {dcm_dir}")
+        staged = Path(tmpdir) / fname
+        with gzip.open(gz, "rb") as fin, open(staged, "wb") as fout:
+            shutil.copyfileobj(fin, fout)
+        paths.append(str(staged))
+    return paths
 
 
 def _process_one_series(args):
     """Worker: reconstruct one series, return its manifest row. Never raises
     (a raised exception in a Pool worker would kill the pool)."""
-    group_uid, gdf, dcm_dir_str, output_dir_str, min_slices = args
+    group_uid, gdf, dcm_dir_str, output_dir_str, min_slices, staging_root = args
     dcm_dir = Path(dcm_dir_str)
     output_file = Path(output_dir_str) / f"{group_uid}.nii.gz"
 
@@ -180,12 +245,14 @@ def _process_one_series(args):
         gdf_sorted = _sort_along_normal(gdf).drop_duplicates(
             subset="image_pos_z", keep="first"
         )
-        dcm_files = [str(dcm_dir / fname) for fname in gdf_sorted["filename"]]
         try:
-            reader = sitk.ImageSeriesReader()
-            reader.SetFileNames(dcm_files)
-            image = reader.Execute()
-            sitk.WriteImage(image, str(output_file))
+            # TemporaryDirectory removes the staged .dcm files even on failure.
+            with tempfile.TemporaryDirectory(dir=staging_root) as tmpdir:
+                dcm_files = _stage_series(dcm_dir, gdf_sorted["filename"], tmpdir)
+                reader = sitk.ImageSeriesReader()
+                reader.SetFileNames(dcm_files)
+                image = _force_axial_frame(reader.Execute())
+                sitk.WriteImage(image, str(output_file))
             stats["status"] = "reconstructed"
             stats["output_path"] = str(output_file)
         except Exception as e:
@@ -209,6 +276,10 @@ def reconstruct_from_index(metadata_csv, dcm_dir, output_dir,
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "reconstruction_manifest.csv"
+    # Scratch space for gunzipping .dcm.gz series. Under output_dir so it lands
+    # on the same (large) volume as the NIfTIs rather than a small /tmp.
+    staging_root = output_dir / ".staging"
+    staging_root.mkdir(exist_ok=True)
 
     if n_workers is None:
         n_workers = min(os.cpu_count() or 4, 16)
@@ -227,7 +298,7 @@ def reconstruct_from_index(metadata_csv, dcm_dir, output_dir,
           f"min_slices={min_slices}  n_workers={n_workers}. "
           f"Manifest -> {manifest_path}")
 
-    tasks = [(uid, gdf, str(dcm_dir), str(output_dir), min_slices)
+    tasks = [(uid, gdf, str(dcm_dir), str(output_dir), min_slices, str(staging_root))
              for uid, gdf in groups]
 
     if n_workers <= 1:
@@ -263,6 +334,8 @@ def reconstruct_from_index(metadata_csv, dcm_dir, output_dir,
         print(f"  duplicate z (deduped):     {dup_z}")
         print(f"  mixed orientation (skip):  {mixed_or}")
 
+    shutil.rmtree(staging_root, ignore_errors=True)
+
     write_clean_subset(manifest, manifest_path, tilt_thresh=clean_tilt_thresh)
     return manifest
 
@@ -278,7 +351,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--dcm_dir", required=True,
-        help="Directory containing the .dcm files referenced by --metadata_csv.",
+        help="Directory containing the .dcm (or .dcm.gz) files referenced by "
+             "--metadata_csv.",
     )
     parser.add_argument(
         "--output_dir", required=True,

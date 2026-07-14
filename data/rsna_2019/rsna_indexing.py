@@ -3,7 +3,9 @@ RSNA 2019 DICOM indexer — Step 1 of the rsna_2019 pipeline.
 
 Walks --dcm_dir, reads headers (no pixels), appends per-slice rows to
 --output_csv (see COLUMNS for the schema). Resumable: re-runs skip
-filenames already in the CSV.
+filenames already in the CSV. Files may be .dcm or .dcm.gz; the CSV
+always stores the .dcm name, so step 2 works on selectively
+decompressed series without re-indexing.
 
 Many captured fields (scan/pixel/window) are unused by the current DRR
 pipeline but kept because re-indexing 750k files is expensive. The
@@ -20,6 +22,7 @@ Step 2 = rsna_volumetric_reconstruction.py.
 """
 
 import argparse
+import gzip
 import os
 import warnings
 from multiprocessing import Pool
@@ -182,18 +185,30 @@ def _row_from_ds(ds, filename):
     }
 
 
+def _canonical_name(path: Path) -> str:
+    """Filename as stored in the CSV: the .dcm name, with a trailing .gz
+    stripped. Keeps the index valid for step 2 after selective gunzip."""
+    return path.name[:-3] if path.name.endswith(".gz") else path.name
+
+
 def extract_metadata(dcm_path):
     """Entry point. Returns a dict with COLUMNS as keys.
 
-    On failure, returns a row with all fields NaN except ``filename`` and
-    ``error``. Never raises to ensure the pool continues.
+    Accepts plain .dcm or gzipped .dcm.gz (header-only read, so the gzip
+    overhead is negligible). On failure, returns a row with all fields NaN
+    except ``filename`` and ``error``. Never raises to ensure the pool
+    continues.
     """
     try:
-        ds = pydicom.dcmread(str(dcm_path), stop_before_pixels=True)
-        return _row_from_ds(ds, dcm_path.name)
+        if dcm_path.suffix == ".gz":
+            with gzip.open(dcm_path, "rb") as f:
+                ds = pydicom.dcmread(f, stop_before_pixels=True)
+        else:
+            ds = pydicom.dcmread(str(dcm_path), stop_before_pixels=True)
+        return _row_from_ds(ds, _canonical_name(dcm_path))
     except Exception as e:
         row: dict[str, Any] = {col: None for col in COLUMNS}
-        row["filename"] = dcm_path.name
+        row["filename"] = _canonical_name(dcm_path)
         row["error"] = f"{type(e).__name__}: {e}"
         return row
 
@@ -230,13 +245,20 @@ def build_metadata_index(dcm_dir, output_csv, n_workers=None, batch_size=5000):
         n_workers = min(os.cpu_count() or 4, 16) # one for seq equivalence
 
     print(f"Listing files under {dcm_dir} ...")
-    all_files = sorted(f for f in dcm_dir.iterdir() if f.suffix == ".dcm")
+    # Accept .dcm and .dcm.gz; if both exist for the same slice, prefer .dcm.
+    by_name: dict[str, Path] = {}
+    for f in dcm_dir.iterdir():
+        if f.suffix == ".dcm" or f.name.endswith(".dcm.gz"):
+            key = _canonical_name(f)
+            if key not in by_name or f.suffix == ".dcm":
+                by_name[key] = f
+    all_files = sorted(by_name.values())
     print(f"Found {len(all_files)} DICOM files")
 
     done = _load_existing_filenames(output_csv)
     if done:
         before = len(all_files)
-        all_files = [f for f in all_files if f.name not in done]
+        all_files = [f for f in all_files if _canonical_name(f) not in done]
         print(f"Resuming: {before - len(all_files)} already in {output_csv}, "
               f"{len(all_files)} to process.")
 
@@ -339,7 +361,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--dcm_dir", required=True,
-        help="Directory containing .dcm files (e.g. stage_2_train_images).",
+        help="Directory containing .dcm or .dcm.gz files (e.g. stage_2_train).",
     )
     parser.add_argument(
         "--output_csv", required=True,
