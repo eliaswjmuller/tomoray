@@ -1,0 +1,12 @@
+
+defaults:
+  - dataset: rsna_brain
+  - model: vq_gan_3d_brain
+  - _self_
+
+
+seed: 1
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}

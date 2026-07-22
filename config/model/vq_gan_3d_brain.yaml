@@ -1,0 +1,40 @@
+seed: 1
+batch_size: 4               # max that fits on one 95GB Blackwell (8/16 OOM on the codebook's
+                            # [B*48*64*64, 4096] distance/one-hot matrices); peak ~57GB. bf16-mixed.
+num_workers: 8
+name: vq_gan_3d
+gpus: 3                     # 3 GPUs via DDP (GPU 1 excluded - uncorrectable ECC errors, needs RMA).
+                            # Launch with run_vqgan.sh which pins CUDA_VISIBLE_DEVICES=0,2,3.
+                            # broadcast_buffers=False so the codebook's own all_reduce syncs its buffers.
+                            # batch 4/GPU -> effective 12. Restore to 4 once GPU 1 is fixed.
+accumulate_grad_batches: 1  # unused under manual optimization; kept for reference
+default_root_dir: /home/user/Desktop/tomoray/vqgan_runs
+default_root_dir_postfix: ''
+resume_from_checkpoint:     # null -> fresh run; set a .ckpt path to resume
+max_steps: -1
+max_epochs: 300
+precision: bf16-mixed       # Blackwell-native; ~2x faster, half the memory (no loss-scaler needed for bf16)
+gradient_clip_val: 1.0      # applied inside training_step (manual optimization)
+save_every_n_steps: 5000    # periodic checkpoint cadence
+check_val_every_n_epoch: 1  # validate + update best-loss checkpoint every epoch
+
+embedding_dim: 8
+n_codes: 4096
+n_hiddens: 16
+lr: 3e-5
+downsample: [2, 2, 2]
+disc_channels: 64
+disc_layers: 3
+discriminator_iter_start: 2000
+disc_loss_type: hinge
+image_gan_weight: 1.0
+video_gan_weight: 1.0
+l1_weight: 4.0
+gan_feat_weight: 4.0
+perceptual_weight: 1.0
+i3d_feat: False
+restart_thres: 1.0
+no_random_restart: False
+norm_type: group
+padding_type: replicate
+num_groups: 8

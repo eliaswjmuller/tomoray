@@ -50,6 +50,11 @@ class VQGAN(pl.LightningModule):
     def __init__(self, cfg, val_dataloader=None):
         super().__init__()
 
+        # PL 2.x: autoencoder + two discriminators are stepped with separate
+        # optimizers, so we drive them manually (optimizer_idx / automatic
+        # multi-optimizer stepping were removed in Lightning 2.0).
+        self.automatic_optimization = False
+
         if isinstance(cfg, dict):
             cfg = OmegaConf.create(cfg)
 
@@ -249,30 +254,54 @@ class VQGAN(pl.LightningModule):
 
             return discloss
 
-        perceptual_loss = self.perceptual_model(frames, frames_recon) * self.perceptual_weight
+        perceptual_loss = self.perceptual_model(frames, frames_recon).mean() * self.perceptual_weight
         return recon_loss, x_recon, vq_output, perceptual_loss
 
 
-    def training_step(self, batch, batch_idx, optimizer_idx):
+    def training_step(self, batch, batch_idx):
+        # Manual optimization (PL 2.x): one autoencoder step then one
+        # discriminator step per batch, each with its own backward. adopt_weight()
+        # inside forward() holds the adversarial terms at zero until
+        # global_step >= discriminator_iter_start, so before then only
+        # recon/commitment/perceptual train the AE and the disc does not move.
         x = batch['image']
-        if optimizer_idx == 0:
-            recon_loss, _, vq_output, aeloss, perceptual_loss, gan_feat_loss = self.forward(
-                x, optimizer_idx)
-            commitment_loss = vq_output['commitment_loss']
-            loss = recon_loss + commitment_loss + aeloss + perceptual_loss + gan_feat_loss
-        if optimizer_idx == 1:
-            discloss = self.forward(x, optimizer_idx)
-            loss = discloss
+        opt_ae, opt_disc = self.optimizers()
+        gclip = self.cfg.model.gradient_clip_val
 
-        return loss
+        # -- autoencoder + codebook --
+        # toggle_optimizer() flips requires_grad to opt_ae's params only for this
+        # backward (restored after), so g_loss through the frozen discriminators
+        # leaves no stray grads -- and DDP sees a consistent used-param set.
+        self.toggle_optimizer(opt_ae)
+        recon_loss, _, vq_output, aeloss, perceptual_loss, gan_feat_loss = self.forward(x, 0)
+        commitment_loss = vq_output['commitment_loss']
+        loss_ae = recon_loss + commitment_loss + aeloss + perceptual_loss + gan_feat_loss
+        opt_ae.zero_grad(set_to_none=True)
+        self.manual_backward(loss_ae)
+        if gclip and gclip > 0:
+            self.clip_gradients(opt_ae, gradient_clip_val=gclip, gradient_clip_algorithm="norm")
+        opt_ae.step()
+        self.untoggle_optimizer(opt_ae)
+
+        # -- discriminators --
+        self.toggle_optimizer(opt_disc)
+        discloss = self.forward(x, 1)
+        opt_disc.zero_grad(set_to_none=True)
+        self.manual_backward(discloss)
+        if gclip and gclip > 0:
+            self.clip_gradients(opt_disc, gradient_clip_val=gclip, gradient_clip_algorithm="norm")
+        opt_disc.step()
+        self.untoggle_optimizer(opt_disc)
+
+        self.log("train/loss_ae", loss_ae, prog_bar=True, on_step=True, on_epoch=True)
 
     def validation_step(self, batch, batch_idx):
         x = batch['image']  # TODO: batch['stft']
         recon_loss, _, vq_output, perceptual_loss = self.forward(x)
-        self.log('val/recon_loss', recon_loss, prog_bar=True)
-        self.log('val/perceptual_loss', perceptual_loss, prog_bar=True)
-        self.log('val/perplexity', vq_output['perplexity'], prog_bar=True)
-        self.log('val/commitment_loss', vq_output['commitment_loss'], prog_bar=True)
+        self.log('val/recon_loss', recon_loss, prog_bar=True, sync_dist=True)
+        self.log('val/perceptual_loss', perceptual_loss, prog_bar=True, sync_dist=True)
+        self.log('val/perplexity', vq_output['perplexity'], prog_bar=True, sync_dist=True)
+        self.log('val/commitment_loss', vq_output['commitment_loss'], prog_bar=True, sync_dist=True)
 
     def configure_optimizers(self):
         lr = self.cfg.model.lr
@@ -285,7 +314,9 @@ class VQGAN(pl.LightningModule):
         opt_disc = torch.optim.Adam(list(self.image_discriminator.parameters()) +
                                     list(self.video_discriminator.parameters()),
                                     lr=lr, betas=(0.5, 0.9))
-        return [opt_ae, opt_disc], []
+        # Manual optimization: return optimizers directly; self.optimizers()
+        # then yields them in this order (opt_ae, opt_disc).
+        return [opt_ae, opt_disc]
     
     def log_images(self, batch, **kwargs):
         log = dict()
