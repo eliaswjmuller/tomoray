@@ -50,9 +50,7 @@ class VQGAN(pl.LightningModule):
     def __init__(self, cfg, val_dataloader=None):
         super().__init__()
 
-        # PL 2.x: autoencoder + two discriminators are stepped with separate
-        # optimizers, so we drive them manually (optimizer_idx / automatic
-        # multi-optimizer stepping were removed in Lightning 2.0).
+        # Manual optimization: separate optimizers for autoencoder and discriminators.
         self.automatic_optimization = False
 
         if isinstance(cfg, dict):
@@ -259,19 +257,14 @@ class VQGAN(pl.LightningModule):
 
 
     def training_step(self, batch, batch_idx):
-        # Manual optimization (PL 2.x): one autoencoder step then one
-        # discriminator step per batch, each with its own backward. adopt_weight()
-        # inside forward() holds the adversarial terms at zero until
-        # global_step >= discriminator_iter_start, so before then only
-        # recon/commitment/perceptual train the AE and the disc does not move.
+        # One autoencoder step then one discriminator step per batch. adopt_weight()
+        # in forward() keeps adversarial terms at zero until discriminator_iter_start.
         x = batch['image']
         opt_ae, opt_disc = self.optimizers()
         gclip = self.cfg.model.gradient_clip_val
 
         # -- autoencoder + codebook --
-        # toggle_optimizer() flips requires_grad to opt_ae's params only for this
-        # backward (restored after), so g_loss through the frozen discriminators
-        # leaves no stray grads -- and DDP sees a consistent used-param set.
+        # toggle_optimizer() isolates grads to opt_ae's params for this backward.
         self.toggle_optimizer(opt_ae)
         recon_loss, _, vq_output, aeloss, perceptual_loss, gan_feat_loss = self.forward(x, 0)
         commitment_loss = vq_output['commitment_loss']

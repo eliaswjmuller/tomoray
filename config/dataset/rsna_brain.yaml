@@ -1,5 +1,5 @@
 name: rsna2019_clean
-# RSNA reconstruction NIfTIs on oppenheimer (output of data/rsna_2019 pipeline).
+# RSNA reconstruction NIfTIs (output of the data/rsna_2019 pipeline).
 root_dir: /home/user/Desktop/tomoray/datasets/Brain_RSNA_2019/brain_rsna_2019/nifti
 
 # Ablation selector (relative to root_dir, or absolute). clean-only for now;

@@ -1,15 +1,10 @@
-"""Train the 3D VQGAN feature extractor (PL 2.x, manual optimization, multi-GPU).
+"""Train the 3D VQGAN feature extractor (PL 2.x, manual optimization).
 
-Ported from the PL 1.6 original to run on Lightning 2.x / recent CUDA (e.g. the
-Blackwell GPUs on oppenheimer). Trains ONLY the VQGAN autoencoder+codebook -- no
-DDPM, no DRRs. Reads CT NIfTIs directly via train/get_vqgan_dataset.py.
+Trains only the VQGAN autoencoder + codebook; reads CT NIfTIs via
+train/get_vqgan_dataset.py. Config: config/train.yaml -> {dataset, model}.
+DDP is used automatically when model.gpus > 1.
 
-Launch (repo root, on a machine with the `tomoray` env):
-    python train/train_vqgan.py                       # uses config/train.yaml defaults
-
-Key config lives in config/train.yaml -> {dataset, model}. Multi-GPU is controlled
-by model.gpus (DDP is used automatically when >1). To train the clean RSNA subset
-point dataset.subset_csv at clean_subset.csv (already the default rsna_brain config).
+    python train/train_vqgan.py
 """
 
 import os
@@ -33,10 +28,9 @@ from train.get_vqgan_dataset import get_dataset
 
 @hydra.main(config_path='../config', config_name='train', version_base=None)
 def run(cfg: DictConfig):
-    # Free tensor-core speedup for fp32 matmuls on Blackwell (PL warns otherwise).
+    # Tensor-core speedup for fp32 matmuls.
     torch.set_float32_matmul_precision('high')
-    # Benign under DDP + manual optimization (DDP stashes autograd nodes across iters);
-    # silence the per-iteration AccumulateGrad stream-mismatch spam to keep logs clean.
+    # Silence the benign AccumulateGrad stream-mismatch warning under DDP + manual opt.
     try:
         torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
     except AttributeError:
@@ -55,9 +49,7 @@ def run(cfg: DictConfig):
         num_workers=cfg.model.num_workers, pin_memory=True,
         persistent_workers=cfg.model.num_workers > 0)
 
-    # Self-documenting run directory: encodes dataset (incl. subset via dataset.name)
-    # and input grid. Deterministic (no timestamp) so all DDP ranks agree on the path.
-    #   e.g. .../vqgan_runs/rsna2019_clean__sp128x128x96/
+    # Run dir from dataset name + input grid; deterministic so all DDP ranks agree.
     sp = "x".join(str(s) for s in cfg.dataset.spatial_size)
     run_name = f"{cfg.dataset.name}__sp{sp}"
     run_dir = os.path.join(cfg.model.default_root_dir, run_name)
@@ -84,6 +76,20 @@ def run(cfg: DictConfig):
         OmegaConf.save(cfg, os.path.join(run_dir, "config_snapshot.yaml"))
 
     model = VQGAN(cfg, val_dataloader=val_dataloader)
+
+    # Fine-tuning: initialize weights from a pretrained checkpoint, then train FRESH
+    # (new optimizer/epoch/step -- NOT a resume). Distinct from resume_from_checkpoint.
+    ft = cfg.model.get("finetune_from", None)
+    if ft:
+        ft = ft if os.path.isabs(ft) else hydra.utils.to_absolute_path(ft)
+        sd = torch.load(ft, map_location="cpu", weights_only=False)
+        sd = sd.get("state_dict", sd)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        # CRITICAL: keep the pretrained codebook -- without this the first training
+        # batch would re-run _init_embeddings and overwrite it with a fresh init.
+        model.codebook._need_init = False
+        print(f"[finetune] loaded weights from {ft} | missing={len(missing)} unexpected={len(unexpected)} "
+              f"| codebook._need_init=False (pretrained codebook kept)")
     callbacks = [
         # best models by reconstruction loss (the metric that tracks feature quality)
         ModelCheckpoint(

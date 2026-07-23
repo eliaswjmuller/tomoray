@@ -1,0 +1,40 @@
+# Fine-tune config: initialize from a pretrained VQGAN and adapt to new data.
+# Same architecture as vq_gan_3d_brain (weights loaded via finetune_from),
+# lower LR, discriminator active from step 0 (both G and D are already trained).
+seed: 1
+batch_size: 4
+num_workers: 8
+name: vq_gan_3d
+gpus: 3                     # DDP device count (>1 uses DDP)
+accumulate_grad_batches: 1
+default_root_dir: /home/user/Desktop/tomoray/vqgan_runs
+default_root_dir_postfix: ''
+resume_from_checkpoint:     # leave null; fine-tuning uses finetune_from (weights only)
+finetune_from: /home/user/Desktop/tomoray/vqgan_runs/vqgan_clean_tilt_best.ckpt
+max_steps: -1
+max_epochs: 100
+precision: bf16-mixed
+gradient_clip_val: 1.0
+save_every_n_steps: 2000
+check_val_every_n_epoch: 1
+
+embedding_dim: 8
+n_codes: 4096
+n_hiddens: 16
+lr: 1e-5                    # lower than pretrain (3e-5) to adapt without forgetting
+downsample: [2, 2, 2]
+disc_channels: 64
+disc_layers: 3
+discriminator_iter_start: 0    # GAN on from the start (discriminator is pretrained)
+disc_loss_type: hinge
+image_gan_weight: 1.0
+video_gan_weight: 1.0
+l1_weight: 4.0
+gan_feat_weight: 4.0
+perceptual_weight: 1.0
+i3d_feat: False
+restart_thres: 1.0
+no_random_restart: False
+norm_type: group
+padding_type: replicate
+num_groups: 8

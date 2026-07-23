@@ -1,0 +1,11 @@
+name: brain_internal
+# Internal diagnostic head CTs (fine-tuning target).
+root_dir: /home/user/Desktop/tomoray/datasets/brain_dataset/CTs
+ext: .nii.gz
+recursive: true
+
+subset_csv: null
+split_by_patient: true      # group NORM/HEM/plain variants of a patient into one split (no leakage)
+
+image_channels: 1
+spatial_size: [128, 128, 96]   # match the pretrained model's input grid
