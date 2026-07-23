@@ -1,5 +1,0 @@
-name: brain
-root_dir: /data/datasets/brain_dataset/CTs
-
-image_channels: 1
-spatial_size: [128, 128, 96]
