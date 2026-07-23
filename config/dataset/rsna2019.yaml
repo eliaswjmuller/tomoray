@@ -1,3 +1,0 @@
-name: 'rsna2019'
-folder: '/data/datasets/RSNA2019/DRRs'
-split_path: '/data/datasets/RSNA2019/DRRs/splits.json'
