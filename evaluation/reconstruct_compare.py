@@ -39,6 +39,11 @@ def tag(fname):
     u = fname.upper()
     return "HEM" if "HEM" in u else ("NORM" if "NORM" in u else "plain")
 
+def pid(fname):
+    # patient id = filename prefix; the test set holds near-duplicate NORM/HEM
+    # scans per patient, so dedup
+    return os.path.basename(fname).split('_')[0]
+
 def psnr(a, b):
     mse = ((a - b) ** 2).mean().item()
     return 10.0 * np.log10(1.0 / max(mse, 1e-10))
@@ -62,9 +67,19 @@ def main():
         scored.append((psnr((x + 1) / 2, (xr + 1) / 2), i))
     del m; torch.cuda.empty_cache()
     scored.sort() # worst first
-    picks = [i for _, i in scored[:N_CASES]]
+    # Keep only the worst scan per patient to ensure no near dups
+    picks, seen = [], set()
+    for _, i in scored:
+        p = pid(files[i])
+        if p in seen:
+            continue
+        seen.add(p)
+        picks.append(i)
+        if len(picks) == N_CASES:
+            break
     print(f"{RANK_BY} PSNR range over {len(ds)} test cases: "
-          f"{scored[0][0]:.1f} (worst) .. {scored[-1][0]:.1f} (best); showing worst {N_CASES}")
+          f"{scored[0][0]:.1f} (worst) .. {scored[-1][0]:.1f} (best); "
+          f"showing worst {len(picks)} DISTINCT patients")
 
     # Pass 2: reconstruct with both models
     vols = {i: ds[i]["image"].unsqueeze(0).float() for i in picks}
