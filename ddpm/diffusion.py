@@ -550,7 +550,7 @@ class Unet3D(nn.Module):
     def forward_with_cond_scale(
         self,
         *args,
-        cond_scale=2.,
+        cond_scale=1.,
         **kwargs
     ):
         logits = self.forward(*args, cond_drop_prob=0., **kwargs)
@@ -1012,6 +1012,9 @@ class Trainer(object):
         num_frames = diffusion_model.num_frames
 
         self.cfg = cfg
+        # sampling guidance strength; measured optimum is 3.0 (monotone to 3.0,
+        # flat at 4.0). Was hardcoded 2.0 in three places.
+        self.cond_scale = float(cfg.model.get('cond_scale', 3.0))
         self.debug_overfit = debug_overfit
 
         self.writer = None
@@ -1365,7 +1368,7 @@ class Trainer(object):
 
                     all_samples = self.ema_model.sample_dpm(
                         cond=sample_cond,
-                        cond_scale=2.0,
+                        cond_scale=self.cond_scale,
                         batch_size = 1,
                         steps=20
                     )
@@ -1401,7 +1404,7 @@ class Trainer(object):
 
                     sample_cond_val = self.fusion_model(sample_xrays_val, sample_angles_val)
                     gen_val = self.ema_model.sample_dpm(
-                        cond=sample_cond_val, cond_scale=2.0, batch_size=1, steps=20
+                        cond=sample_cond_val, cond_scale=self.cond_scale, batch_size=1, steps=20
                     )
 
                     mid_v = gen_val.shape[2] // 2
@@ -1479,7 +1482,7 @@ class Trainer(object):
 
             gen_test = self.ema_model.sample_dpm(
                 cond=test_cond, 
-                cond_scale=2.0, 
+                cond_scale=self.cond_scale,
                 batch_size=test_img.shape[0], 
                 steps=20
             )

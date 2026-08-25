@@ -31,6 +31,7 @@ from ddpm.diffusion import Unet3D, GaussianDiffusion
 from features_fusion.fusion import Fusion
 from get_ddpm_dataset import get_dataset
 from data.generate_drr_brain import render_views
+from evaluation.brain_mask import intracranial_mask, hu_mae, masked_psnr
 
 
 @hydra.main(version_base=None, config_path="../config", config_name="base_cfg")
@@ -86,7 +87,7 @@ def run(cfg: DictConfig):
              ("cfg1.5", 1.5, False), ("cfg2.0", 2.0, False),
              ("cfg2.5", 2.5, False), ("cfg3.0", 3.0, False),
              ("cfg4.0", 4.0, False), ("swap2.0", 2.0, True)]
-    res = {k: {"vol": [], "rep": []} for k, _, _ in conds}
+    res = {k: {"vol": [], "rep": [], "bmae": [], "bpsnr": []} for k, _, _ in conds}
     floor = []
 
     for c, (idx, jdx) in enumerate(zip(cases, nxt)):
@@ -102,6 +103,10 @@ def run(cfg: DictConfig):
         f = (p_real - p_in).abs().mean().item()
         floor.append(f)
 
+        # mask comes from the REAL volume, so every condition is scored on the
+        # same voxels and the comparison stays like-for-like
+        bmask = intracranial_mask(img[0, 0].cpu().numpy())
+
         it2 = val_ds[jdx]
         pin2 = it2["projections"].unsqueeze(0).to(device)
         ang2 = it2["angles"].unsqueeze(0).to(device)
@@ -116,25 +121,35 @@ def run(cfg: DictConfig):
             vmae = (g - img).abs().mean().item()
             # always score against THIS case's real X-rays
             rmae = (reproject(g.cpu(), angles_np) - p_in).abs().mean().item()
+            gn, xn = g[0, 0].cpu().numpy(), img[0, 0].cpu().numpy()
+            if bmask.any():
+                bmae = hu_mae(float(np.abs(gn - xn)[bmask].mean()))
+                bpsnr = masked_psnr(xn, gn, bmask)
+            else:
+                bmae = bpsnr = float("nan")
             res[name]["vol"].append(vmae)
             res[name]["rep"].append(rmae)
-            line.append(f"{name}: vol={vmae:.4f} rep={rmae:.4f}")
+            res[name]["bmae"].append(bmae)
+            res[name]["bpsnr"].append(bpsnr)
+            line.append(f"{name}: brain={bmae:.1f}HU rep={rmae:.4f}")
         print("  ".join(line), flush=True)
 
     print("\n" + "=" * 78)
     print(f"RE-PROJECTION CONSISTENCY + ABLATION   n={n_cases}  step={d['step']}")
     print("=" * 78)
-    print(f"{'condition':<10} {'vol MAE':>16} {'reproj MAE':>18}   note")
+    print(f"{'condition':<10} {'brain MAE':>11} {'brain PSNR':>11} "
+          f"{'vol MAE':>10} {'reproj MAE':>18}   note")
     fl = np.array(floor)
-    print(f"{'-- floor':<10} {'':>16} {fl.mean():>10.4f} +-{fl.std():.4f}   "
+    print(f"{'-- floor':<10} {'':>11} {'':>11} {'':>10} {fl.mean():>10.4f} +-{fl.std():.4f}   "
           f"real volume re-rendered")
     for name, _, _ in conds:
         v = np.array(res[name]["vol"]); r = np.array(res[name]["rep"])
+        bm = np.array(res[name]["bmae"]); bp = np.array(res[name]["bpsnr"])
         note = {"cfg0.0": "PRIOR ONLY (floor for conditioning)",
                 "swap2.0": "WRONG X-rays (control)",
                 "cfg2.0": "<- what training used"}.get(name, "")
-        print(f"{name:<10} {v.mean():>8.4f} +-{v.std():.4f} "
-              f"{r.mean():>10.4f} +-{r.std():.4f}   {note}")
+        print(f"{name:<10} {np.nanmean(bm):>8.2f}HU {np.nanmean(bp):>9.2f}dB "
+              f"{v.mean():>10.4f} {r.mean():>10.4f} +-{r.std():.4f}   {note}")
 
     b, p = np.array(res["cfg2.0"]["rep"]), np.array(res["cfg0.0"]["rep"])
     s = np.array(res["swap2.0"]["rep"])

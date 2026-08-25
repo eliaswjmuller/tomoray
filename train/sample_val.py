@@ -6,7 +6,7 @@ loads the EMA weights, and renders one figure per val case:
   row 2 = ground-truth CT slices
   row 3 = generated slices at the same depths
 
-Overrides: +milestone=149 +n_cases=8 +cond_scale=2.0 +dpm_steps=20 +seed=0
+Overrides: +milestone=149 +n_cases=8 +cond_scale_s=3.0 +dpm_steps=20 +seed=0
 """
 import os
 import sys
@@ -31,7 +31,8 @@ from get_ddpm_dataset import get_dataset
 def run(cfg: DictConfig):
     milestone  = int(cfg.get("milestone", 149))
     n_cases    = int(cfg.get("n_cases", 8))
-    cond_scale = float(cfg.get("cond_scale_s", 2.0))
+    # +cond_scale_s= overrides; otherwise follow model.cond_scale
+    cond_scale = float(cfg.get("cond_scale_s", cfg.model.cond_scale))
     dpm_steps  = int(cfg.get("dpm_steps", 20))
     seed       = int(cfg.get("seed", 0))
     outdir     = cfg.get("outdir", os.path.expanduser(
