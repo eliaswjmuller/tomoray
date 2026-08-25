@@ -1,5 +1,6 @@
 import sys
 import os
+import glob
 import torch
 from monai.data.meta_tensor import MetaTensor
 torch.serialization.add_safe_globals([MetaTensor])
@@ -15,7 +16,7 @@ sys.path.append(parent_dir)
 
 from ddpm.diffusion import Unet3D, GaussianDiffusion, Trainer
 from features_fusion.fusion import Fusion
-from get_dataset import get_dataset
+from get_ddpm_dataset import get_dataset
 
 @hydra.main(version_base=None, config_path="../config", config_name="base_cfg")
 def run(cfg: DictConfig):
@@ -24,7 +25,9 @@ def run(cfg: DictConfig):
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         mixed_precision="bf16" if cfg.model.amp and torch.cuda.is_available() else "no",
-        gradient_accumulation_steps=cfg.model.gradient_accumulate_every,
+        # 1, NOT gradient_accumulate_every: Trainer already divides the loss itself and
+        # Accelerator.backward() would divide a second time (grads 1/9 instead of 1/3).
+        gradient_accumulation_steps=1,
         kwargs_handlers=[process_group_kwargs, ddp_kwargs]
     )
     if accelerator.is_main_process:
@@ -46,21 +49,28 @@ def run(cfg: DictConfig):
         print(f"Results folder: {cfg.model.results_folder}")
         os.makedirs(cfg.model.results_folder, exist_ok=True)
 
-    latent_size = cfg.model.diffusion_img_size
+    latent_size = cfg.model.diffusion_img_size          # h = w (64)
+    depth_size = cfg.model.diffusion_depth_size         # f (48, non-cubic)
     latent_channels = cfg.model.diffusion_num_channels
     fusion_channels = 128
+    fz = cfg.model.fusion
 
     fusion_model = Fusion(
-        volume_shape=(latent_size, latent_size, latent_size),
-        vol_size_mm=cfg.model.vol_size_mm,
-        det_size_mm=cfg.model.det_size_mm,
-        n_features=fusion_channels
+        volume_shape=(depth_size, latent_size, latent_size),
+        vol_spacing=fz.vol_spacing,
+        n_features=fusion_channels,
+        num_views=fz.num_views,
+        total_deg=fz.total_deg,
+        start_deg=fz.start_deg,
+        endpoint=fz.endpoint,
+        sdd=fz.sdd, sid=fz.sid,
+        det_h=fz.det, det_w=fz.det, delx=fz.delx,
     )
     if accelerator.is_main_process:
         print("Initialization of 3D U-Net")
 
     unet = Unet3D(
-        dim=64,
+        dim=cfg.model.dim,
         dim_mults=cfg.model.dim_mults,
         channels=latent_channels,
         cond_channels=fusion_channels
@@ -72,14 +82,16 @@ def run(cfg: DictConfig):
         unet,
         vqgan_ckpt=cfg.model.vqgan_ckpt,
         image_size=latent_size,
-        num_frames=latent_size,
+        num_frames=depth_size,
         channels=latent_channels,
         timesteps=cfg.model.timesteps,
-        loss_type=cfg.model.loss_type
+        loss_type=cfg.model.loss_type,
+        latent_mean=cfg.model.latent_mean,
+        latent_std=cfg.model.latent_std
 
     )
 
-    train_dataset, val_dataset, _ = get_dataset(cfg)
+    train_dataset, val_dataset, test_dataset = get_dataset(cfg)
 
     trainer = Trainer(
         diffusion_model=diffusion,
@@ -87,6 +99,7 @@ def run(cfg: DictConfig):
         cfg=cfg,
         dataset=train_dataset,
         val_dataset=val_dataset,
+        test_dataset=test_dataset,
         accelerator=accelerator,
         train_batch_size=cfg.model.batch_size,
         train_lr=cfg.model.train_lr,
@@ -94,6 +107,7 @@ def run(cfg: DictConfig):
         gradient_accumulate_every=cfg.model.gradient_accumulate_every,
         ema_decay=cfg.model.ema_decay,
         amp=cfg.model.amp,
+        max_grad_norm=cfg.model.max_grad_norm,
         save_and_sample_every=cfg.model.save_and_sample_every,
         results_folder=cfg.model.results_folder,
         num_workers=cfg.model.num_workers,
@@ -101,10 +115,11 @@ def run(cfg: DictConfig):
 
     )
 
+    ckpt_dir = os.path.join(cfg.model.results_folder, 'checkpoints')
     if cfg.model.load_milestone != -1:
-         trainer.load(cfg.model.load_milestone)
-    elif cfg.model.load_milestone == -1 and os.path.exists(os.path.join(cfg.model.results_folder, 'checkpoints')):
-         trainer.load(-1) # Auto-resume
+        trainer.load(cfg.model.load_milestone)
+    elif glob.glob(os.path.join(ckpt_dir, '*.pt')):
+        trainer.load(-1)  # auto-resume (only if a checkpoint actually exists)
     if accelerator.is_main_process:
         print("Starting Training...")
         

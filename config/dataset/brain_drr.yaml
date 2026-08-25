@@ -1,0 +1,6 @@
+name: brain_drr
+# Cone-beam DRR pickles from data/generate_drr_brain.py (each folder has splits.json).
+# RSNA clean+tilt + internal, patient-safe splits, concatenated.
+folders:
+  - /home/user/Desktop/tomoray/datasets/drr_brain/rsna_tilt
+  - /home/user/Desktop/tomoray/datasets/drr_brain/internal

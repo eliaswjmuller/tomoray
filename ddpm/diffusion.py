@@ -1,5 +1,6 @@
 import math
 import copy
+import itertools
 import os.path
 import random
 
@@ -668,6 +669,8 @@ class GaussianDiffusion(nn.Module):
         use_dynamic_thres=False,
         dynamic_thres_percentile=0.9,
         vqgan_ckpt=None,
+        latent_mean=-0.1517,
+        latent_std=2.3610,
     ):
         super().__init__()
 
@@ -675,6 +678,13 @@ class GaussianDiffusion(nn.Module):
         self.image_size = image_size
         self.num_frames = num_frames
         self.denoise_fn = denoise_fn
+
+        # Latent standardization. MUST match vqgan_ckpt: measured over 48 volumes of
+        # the encoder output (quantize=False). The old codebook min/max normalization
+        # gave std 0.072 (13.9x too small) because only ~220 of 4096 codes are live --
+        # the dead ones sit far out in the tails and set the min/max.
+        self.latent_mean = latent_mean
+        self.latent_std = latent_std
 
         if vqgan_ckpt:
             self.vqgan = VQGAN.load_from_checkpoint(vqgan_ckpt, weights_only=False)
@@ -775,6 +785,10 @@ class GaussianDiffusion(nn.Module):
             x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale))
 
         if clip_denoised:
+            # NOTE: latents are now standardized (std 1), not squashed into [-1,1], so
+            # this static s=1 clamp would cut ~32% of values. Only reached via
+            # p_sample_loop/sample(), which nothing calls -- sample_dpm is the live path.
+            # Enable use_dynamic_thres before using sample() again.
             s = 1.
             if self.use_dynamic_thres:
                 s = torch.quantile(
@@ -831,10 +845,7 @@ class GaussianDiffusion(nn.Module):
             (batch_size, channels, num_frames, image_size, image_size), cond=cond, cond_scale=cond_scale)
 
         if isinstance(self.vqgan, VQGAN):
-            # denormalize TODO: Remove eventually
-            _sample = (((_sample + 1.0) / 2.0) * (self.vqgan.codebook.embeddings.max() -
-                                                  self.vqgan.codebook.embeddings.min())) + self.vqgan.codebook.embeddings.min()
-
+            _sample = _sample * self.latent_std + self.latent_mean
             _sample = self.vqgan.decode(_sample, quantize=True)
         else:
             unnormalize_img(_sample)
@@ -876,8 +887,7 @@ class GaussianDiffusion(nn.Module):
         )
 
         if isinstance(self.vqgan, VQGAN):
-            x_sample = (((x_sample + 1.0) / 2.0) * (self.vqgan.codebook.embeddings.max() -
-                                                    self.vqgan.codebook.embeddings.min())) + self.vqgan.codebook.embeddings.min()
+            x_sample = x_sample * self.latent_std + self.latent_mean
             x_sample = self.vqgan.decode(x_sample, quantize=True)
         else:
             x_sample = unnormalize_img(x_sample)
@@ -927,10 +937,8 @@ class GaussianDiffusion(nn.Module):
             with torch.no_grad():
                 x = self.vqgan.encode(
                     x, quantize=False, include_embeddings=True)
-                # normalize to -1 and 1
-                x = ((x - self.vqgan.codebook.embeddings.min()) /
-                     (self.vqgan.codebook.embeddings.max() -
-                      self.vqgan.codebook.embeddings.min())) * 2.0 - 1.0
+                # standardize to ~N(0,1), which is what the noise schedule assumes
+                x = (x - self.latent_mean) / self.latent_std
         else:
             print("Hi")
             x = normalize_img(x)
@@ -1049,8 +1057,10 @@ class Trainer(object):
             )
 
         if self.accelerator:
-            self.model, self.fusion_model, self.opt, dl, val_dl = self.accelerator.prepare(
-                self.model, self.fusion_model, self.opt, dl, val_dl
+            # val/test loaders stay unprepared: validation runs on the main process
+            # only, and a sharded loader would score just 1/num_processes of the set.
+            self.model, self.fusion_model, self.opt, dl = self.accelerator.prepare(
+                self.model, self.fusion_model, self.opt, dl
             )
         else:
             self.model = self.model.to(self.device)
@@ -1079,6 +1089,9 @@ class Trainer(object):
         self.step = 0
 
         self.amp = amp and self.device.type == "cuda"
+        # bf16, matching Accelerator(mixed_precision="bf16"); torch's autocast
+        # default on cuda is fp16, which overflows the vqgan/loss path.
+        self.amp_dtype = torch.bfloat16
         self.scaler = GradScaler(self.device.type, enabled=self.amp)
         self.max_grad_norm = max_grad_norm
 
@@ -1087,6 +1100,11 @@ class Trainer(object):
         self.results_folder.mkdir(exist_ok=True, parents=True)
 
         self.reset_parameters()
+
+    def trainable_parameters(self):
+        """Everything the optimizer owns -- diffusion U-Net AND the Fusion U-Net.
+        Clipping only self.model left the Fusion grads unbounded."""
+        return list(itertools.chain(self.model.parameters(), self.fusion_model.parameters()))
 
     def reset_parameters(self):
         unwrapped_model = self.accelerator.unwrap_model(self.model) if self.accelerator else self.model
@@ -1112,6 +1130,7 @@ class Trainer(object):
             'model': unwrapped_model.state_dict(),
             'fusion': unwrapped_fusion.state_dict(),
             'ema': self.ema_model.state_dict(),
+            'opt': self.opt.state_dict(),   # without this a resume restarts Adam cold
             'scaler': self.scaler.state_dict()
         }
         path_cp = os.path.join(self.results_folder, 'checkpoints')
@@ -1140,17 +1159,20 @@ class Trainer(object):
 
         self.step = data['step']
 
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
-        unwrapped_fusion = self.accelerator.unwrap_model(self.fusion_model)
-        unwrapped_ema = self.accelerator.unwrap_model(self.ema_model)
+        unwrap = self.accelerator.unwrap_model if self.accelerator else (lambda m: m)
+        unwrapped_model = unwrap(self.model)
+        unwrapped_fusion = unwrap(self.fusion_model)
+        unwrapped_ema = unwrap(self.ema_model)
 
-        unwrapped_model.load_state_dict(data['model'], strict=False)
-        unwrapped_fusion.load_state_dict(data['fusion'], strict=False)
-        unwrapped_ema.load_state_dict(data['ema'], strict=False)
-        
-        #self.model.load_state_dict(data['model'], strict=False)
-        #self.fusion_model.load_state_dict(data['fusion'], strict=False)
-        #self.ema_model.load_state_dict(data['ema'], strict=False)
+        # strict=True: a silent partial load looks exactly like a fresh divergence
+        unwrapped_model.load_state_dict(data['model'])
+        unwrapped_fusion.load_state_dict(data['fusion'])
+        unwrapped_ema.load_state_dict(data['ema'])
+
+        if 'opt' in data:
+            self.opt.load_state_dict(data['opt'])
+        else:
+            print("WARNING: checkpoint has no optimizer state, Adam moments restart from zero")
 
         self.scaler.load_state_dict(data['scaler'])
 
@@ -1169,16 +1191,18 @@ class Trainer(object):
         plt.close()
 
     def save_comparison(self, real, fake, path):
-
+        # Fixed [0,1] window on BOTH panels. Without vmin/vmax matplotlib autoscales
+        # each panel to its own extrema, so a washed-out sample renders at full
+        # contrast and looks far better than it is.
         plt.figure(figsize=(10, 5))
         plt.subplot(1, 2, 1)
         plt.title("Real CT")
-        plt.imshow(real.numpy(), cmap='gray')
+        plt.imshow(real.numpy(), cmap='gray', vmin=0.0, vmax=1.0)
         plt.axis('off')
 
         plt.subplot(1, 2, 2)
-        plt.title("Generated")
-        plt.imshow(fake.numpy(), cmap='gray')
+        plt.title(f"Generated [{fake.min():.2f},{fake.max():.2f}]")
+        plt.imshow(fake.numpy(), cmap='gray', vmin=0.0, vmax=1.0)
         plt.axis('off')
         
         plt.savefig(path)
@@ -1200,7 +1224,7 @@ class Trainer(object):
                 xrays = batch['projections'].to(self.device)
                 angles = batch['angles'].to(self.device)
 
-                with autocast(self.device.type, enabled=self.amp):
+                with autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp):
                     
                     cond = self.fusion_model(xrays, angles)
 
@@ -1259,14 +1283,34 @@ class Trainer(object):
 
             if self.accelerator:
                 if exists(self.max_grad_norm):
-                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.opt.step()
-                self.opt.zero_grad()
+                    grad_norm = self.accelerator.clip_grad_norm_(
+                        self.trainable_parameters(), self.max_grad_norm)
+                else:
+                    grad_norm = None
+                # Clipping does NOT stop a NaN: a non-finite total norm makes the clip
+                # coefficient non-finite and poisons every parameter. One bad step then
+                # corrupts Adam's moments permanently, which is how the run to step 12k
+                # went to NaN and never recovered. Skip the step instead.
+                # Decide on grad_norm, not loss: grads are already all-reduced, so it is
+                # identical on every rank (and non-finite if ANY rank went bad), whereas
+                # per-rank loss would let ranks disagree and silently desync DDP.
+                if grad_norm is None:
+                    flag = torch.tensor(
+                        [0.0 if torch.isfinite(loss) else 1.0], device=self.device)
+                    grad_norm = self.accelerator.reduce(flag, reduction="sum")
+                if not torch.isfinite(grad_norm).all():
+                    if self.is_main:
+                        print(f'{self.step}: non-finite loss/grad, step skipped '
+                              f'(loss={loss.item()}, grad_norm={grad_norm})')
+                    self.opt.zero_grad()
+                else:
+                    self.opt.step()
+                    self.opt.zero_grad()
             else:
                 if exists(self.max_grad_norm):
                     self.scaler.unscale_(self.opt)
                     nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.max_grad_norm)
+                        self.trainable_parameters(), self.max_grad_norm)
 
                 self.scaler.step(self.opt)
                 self.scaler.update()
@@ -1288,7 +1332,7 @@ class Trainer(object):
                         val_xrays = val_batch["projections"].to(self.device)
                         val_angles = val_batch["angles"].to(self.device)
 
-                        with autocast(self.device.type, enabled=self.amp):
+                        with autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp):
                             val_cond = self.fusion_model(val_xrays, val_angles)
                             val_loss = self.ema_model(
                                 val_img,
@@ -1378,8 +1422,14 @@ class Trainer(object):
                     
                     self.metrics.save_gif(real_vol=real_val_np, fake_vol=gen_val_np, milestone=milestone, phase="val")
                     
-                    if milestone % 5 == 0:
-                        self.metrics.update_metrics(self.ema_model, self.fusion_model, self.step)
+                    # DISABLED: this ran on rank 0 only, inside `if self.is_main`, doing
+                    # full sampling + LPIPS over all 1717 val volumes. It took >1h, so
+                    # ranks 1/2 blocked at the next collective and NCCL's watchdog
+                    # (timeout 3600s) killed the job at step 5000 -- its first ever call
+                    # (milestone % 5). Score checkpoints offline instead; nothing here
+                    # needs metrics to keep training.
+                    # if milestone % 5 == 0:
+                    #     self.metrics.update_metrics(self.ema_model, self.fusion_model, self.step)
                     
                     
                     if self.writer:
@@ -1417,7 +1467,7 @@ class Trainer(object):
             test_xrays = test_batch["projections"].to(self.device)
             test_angles = test_batch["angles"].to(self.device)
 
-            with autocast(self.device.type, enabled=self.amp):
+            with autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp):
                 test_cond = self.fusion_model(test_xrays, test_angles)
                 
                 test_loss = self.ema_model(
@@ -1492,5 +1542,5 @@ class Trainer(object):
             print(f"Test loss  : {avg_test_loss:.4f}")
             print(f"Mean PSNR : {avg_psnr:.2f} dB")
             print(f"Mean SSIM : {avg_ssim:.4f}")
-            
+
         return avg_test_loss, avg_psnr, avg_ssim

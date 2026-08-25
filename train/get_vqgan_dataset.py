@@ -51,22 +51,17 @@ def _split_by_patient(files_rel, rng, patient_of):
     return splits
 
 
-def get_dataset(cfg):
-    root_dir = hydra.utils.to_absolute_path(cfg.dataset.root_dir)
-    spatial_size = tuple(int(s) for s in cfg.dataset.spatial_size)
-    ext = getattr(cfg.dataset, "ext", ".nii.gz")
-    recursive = bool(getattr(cfg.dataset, "recursive", True))
-    by_patient = bool(getattr(cfg.dataset, "split_by_patient", False))
-    seed = int(cfg.model.seed)
-
-    subset_csv = cfg.dataset.get("subset_csv", None)
+def resolve_splits(root_dir, subset_csv=None, by_patient=False, seed=1,
+                   ext=".nii.gz", recursive=True):
+    """Return a cached 80/10/10 {train,val,test} of root-relative nifti paths.
+    Patient-wise when by_patient (via subset_csv patient_id, else filename prefix)."""
     subset = _load_subset_uids(subset_csv, root_dir)
     uid_to_patient = {}
     if subset is not None:
         keep_uids, uid_to_patient, subset_path = subset
         tag = os.path.splitext(os.path.basename(subset_path))[0]
         if by_patient:
-            tag += "_bypatient"
+            tag += "_bypatient"   # never reuse an older series-level (leaky) split
     else:
         keep_uids, tag = None, ("all_bypatient" if by_patient else "all")
     json_path = os.path.join(root_dir, f"splits_{tag}.json")
@@ -74,38 +69,54 @@ def get_dataset(cfg):
     if os.path.exists(json_path):
         print(f"Loading existing splits : {json_path}")
         with open(json_path) as f:
-            splits = json.load(f)
-    else:
-        print(f"No splits found. Creating 80/10/10 split (subset='{tag}', by_patient={by_patient})...")
-        pattern = os.path.join(root_dir, "**", "*" + ext) if recursive else os.path.join(root_dir, "*" + ext)
-        all_files_rel = [os.path.relpath(p, root_dir) for p in sorted(glob.glob(pattern, recursive=recursive))]
-        if keep_uids is not None:
-            all_files_rel = [r for r in all_files_rel if _uid(r) in keep_uids]
-        if not all_files_rel:
-            raise ValueError(f"No '*{ext}' files found in {root_dir} for subset '{tag}'")
+            return json.load(f)
 
-        rng = random.Random(seed)
-        if by_patient:
-            if uid_to_patient:
-                # RSNA specific patient_id handling
-                missing = [r for r in all_files_rel if _uid(r) not in uid_to_patient]
-                if missing:
-                    raise ValueError(f"{len(missing)} files have no patient_id in "
-                                     f"{subset_csv}, e.g. {[_uid(m) for m in missing[:3]]}")
-                patient_of = lambda r: uid_to_patient[_uid(r)]
-            else:
-                # Internal data: patient = filename token before first '_'.
-                patient_of = lambda r: os.path.basename(r).split("_")[0]
-            splits = _split_by_patient(all_files_rel, rng, patient_of)
+    print(f"No splits found. Creating 80/10/10 split (subset='{tag}', by_patient={by_patient})...")
+    pattern = os.path.join(root_dir, "**", "*" + ext) if recursive else os.path.join(root_dir, "*" + ext)
+    all_files_rel = [os.path.relpath(p, root_dir) for p in sorted(glob.glob(pattern, recursive=recursive))]
+    if keep_uids is not None:
+        all_files_rel = [r for r in all_files_rel if _uid(r) in keep_uids]
+    if not all_files_rel:
+        raise ValueError(f"No '*{ext}' files found in {root_dir} for subset '{tag}'")
+
+    rng = random.Random(seed)
+    if by_patient:
+        if uid_to_patient:
+            missing = [r for r in all_files_rel if _uid(r) not in uid_to_patient]
+            if missing:
+                raise ValueError(f"{len(missing)} files have no patient_id in "
+                                 f"{subset_csv}, e.g. {[_uid(m) for m in missing[:3]]}")
+            patient_of = lambda r: uid_to_patient[_uid(r)]
         else:
-            rng.shuffle(all_files_rel)
-            n = len(all_files_rel); n_tr = int(n * 0.80); n_va = int(n * 0.10)
-            splits = {"train": all_files_rel[:n_tr], "val": all_files_rel[n_tr:n_tr + n_va],
-                      "test": all_files_rel[n_tr + n_va:]}
-        with open(json_path, "w") as f:
-            json.dump(splits, f, indent=4)
-        print(f"Split saved: {json_path} | files train={len(splits['train'])} "
-              f"val={len(splits['val'])} test={len(splits['test'])}")
+            patient_of = lambda r: os.path.basename(r).split("_")[0]
+        splits = _split_by_patient(all_files_rel, rng, patient_of)
+    else:
+        rng.shuffle(all_files_rel)
+        n = len(all_files_rel); n_tr = int(n * 0.80); n_va = int(n * 0.10)
+        splits = {"train": all_files_rel[:n_tr], "val": all_files_rel[n_tr:n_tr + n_va],
+                  "test": all_files_rel[n_tr + n_va:]}
+    # tmp + rename: the DRR generator runs several shard processes against the same
+    # root_dir, and a reader must never see a half-written file.
+    tmp_path = f"{json_path}.{os.getpid()}.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(splits, f, indent=4)
+    os.replace(tmp_path, json_path)
+    print(f"Split saved: {json_path} | files train={len(splits['train'])} "
+          f"val={len(splits['val'])} test={len(splits['test'])}")
+    return splits
+
+
+def get_dataset(cfg):
+    root_dir = hydra.utils.to_absolute_path(cfg.dataset.root_dir)
+    spatial_size = tuple(int(s) for s in cfg.dataset.spatial_size)
+    splits = resolve_splits(
+        root_dir,
+        subset_csv=cfg.dataset.get("subset_csv", None),
+        by_patient=bool(getattr(cfg.dataset, "split_by_patient", False)),
+        seed=int(cfg.model.seed),
+        ext=getattr(cfg.dataset, "ext", ".nii.gz"),
+        recursive=bool(getattr(cfg.dataset, "recursive", True)),
+    )
 
     def make(names, split):
         return VerseDataset(root_dir=root_dir, split=split, spatial_size=spatial_size, data_list=names)

@@ -13,7 +13,7 @@ sys.path.append(parent_dir)
 
 from ddpm.diffusion import Unet3D, GaussianDiffusion, Trainer
 from features_fusion.fusion import Fusion
-from train.get_dataset import get_dataset
+from train.get_ddpm_dataset import get_dataset
 
 @hydra.main(version_base=None, config_path="../config", config_name="base_cfg")
 def run_test(cfg: DictConfig):
@@ -28,18 +28,26 @@ def run_test(cfg: DictConfig):
         )
 
     latent_size = cfg.model.diffusion_img_size
+    depth_size = cfg.model.diffusion_depth_size
     latent_channels = cfg.model.diffusion_num_channels
     fusion_channels = 128
+    fz = cfg.model.fusion
 
+    # must mirror train_ddpm.py exactly, or the loaded weights meet a different geometry
     fusion_model = Fusion(
-        volume_shape=(latent_size, latent_size, latent_size),
-        vol_size_mm=cfg.model.vol_size_mm,
-        det_size_mm=cfg.model.det_size_mm,
-        n_features=fusion_channels
+        volume_shape=(depth_size, latent_size, latent_size),
+        vol_spacing=fz.vol_spacing,
+        n_features=fusion_channels,
+        num_views=fz.num_views,
+        total_deg=fz.total_deg,
+        start_deg=fz.start_deg,
+        endpoint=fz.endpoint,
+        sdd=fz.sdd, sid=fz.sid,
+        det_h=fz.det, det_w=fz.det, delx=fz.delx,
     )
 
     unet = Unet3D(
-        dim=64,
+        dim=cfg.model.dim,
         dim_mults=cfg.model.dim_mults,
         channels=latent_channels,
         cond_channels=fusion_channels
@@ -49,7 +57,7 @@ def run_test(cfg: DictConfig):
         unet,
         vqgan_ckpt=cfg.model.vqgan_ckpt,
         image_size=latent_size,
-        num_frames=latent_size,
+        num_frames=depth_size,
         channels=latent_channels,
         timesteps=cfg.model.timesteps,
         loss_type=cfg.model.loss_type
@@ -71,6 +79,7 @@ def run_test(cfg: DictConfig):
         gradient_accumulate_every=cfg.model.gradient_accumulate_every,
         ema_decay=cfg.model.ema_decay,
         amp=cfg.model.amp,
+        max_grad_norm=cfg.model.max_grad_norm,
         save_and_sample_every=cfg.model.save_and_sample_every,
         results_folder=cfg.model.results_folder,
         num_workers=cfg.model.num_workers,

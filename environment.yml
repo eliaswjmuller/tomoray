@@ -315,7 +315,6 @@ dependencies:
       - terminado==0.18.1
       - threadpoolctl==3.6.0
       - tifffile==2023.9.26
-      - tigre==0.0.1
       - timm==1.0.19
       - tinycss2==1.4.0
       - tomli-w==1.2.0

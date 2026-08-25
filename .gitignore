@@ -1,5 +1,8 @@
 *.pickle
-results/
+# run outputs are ignored, but results docs are tracked
+results/**
+!results/**/
+!results/**/*.md
 outputs/
 __pycache__/
 test.ipynb

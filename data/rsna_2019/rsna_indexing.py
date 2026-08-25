@@ -10,9 +10,9 @@ decompressed series without re-indexing.
 Many captured fields (scan/pixel/window) are unused by the current DRR
 pipeline but kept because re-indexing 750k files is expensive. The
 RSNA anonymizer strips DSD/DSO, SliceThickness, KVP, ConvolutionKernel
-etc., so those are best-effort NaN. DSD/DSO are also absent from
-config/dataset/config_rsna2019.yaml — generate_all.py KeyErrors unless
-they're set per-experiment (intentional, no silent assumption).
+etc., so those are best-effort NaN. The DRR geometry therefore sets
+sdd/sid explicitly per experiment (see data/generate_drr_brain.py and
+features_fusion/cone_geometry.py) rather than reading them from headers.
 
 Labels: --labels_csv defaults to 'auto' (searches --dcm_dir and parent
 for stage_{2,1}_train.csv) and joins to a sibling _labeled.csv so the

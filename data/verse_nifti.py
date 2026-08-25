@@ -18,8 +18,12 @@ from monai.transforms import (
     Flipd
 )
 
+from data.fov_pad import FillFOVPaddingd
+from data.support_removal import RemoveSupportd
+
 class VerseDataset(Dataset):
-    def __init__(self, root_dir, split="train", spatial_size=(128, 128, 128), data_list=None):
+    def __init__(self, root_dir, split="train", spatial_size=(128, 128, 128), data_list=None,
+                 remove_hardware=True):
         self.root_dir = root_dir
 
         if data_list is not None:
@@ -34,6 +38,12 @@ class VerseDataset(Dataset):
             LoadImaged(keys=["image"]),
             EnsureChannelFirstd(keys=["image"]),
             Orientationd(keys=["image"], axcodes="RAS"),
+            # out-of-FOV pad sits at 0 HU (soft tissue) in the internal cohort;
+            # must run on raw HU, before Resized blends it
+            FillFOVPaddingd(keys=["image"]),
+            # scanner head holder: real hardware, but scanner-specific -- a model that
+            # learns it will paint a cradle on external data that has none
+            *([RemoveSupportd(keys=["image"])] if remove_hardware else []),
             ScaleIntensityRanged(
                 keys=["image"], 
                 a_min=-300, a_max=1000, 

@@ -1,26 +1,47 @@
-name: diffusion_all_ctspine_3e-4
+name: diffusion_brain_rsna+internal_cond_5view_dim192_stdlatent
 diffusion: GaussianDiffusion
 denoising_fn: Unet3D
 
 
-vqgan_ckpt: '/home/user/Desktop/tomoray/best_checkpoint-epoch=29-val/recon_loss=0.04.ckpt'
-diffusion_img_size: 64
-diffusion_depth_size: 64
+# Fine-tuned brain VQGAN (internal CTs). DDPM lives in its latent space.
+vqgan_ckpt: '/home/user/Desktop/tomoray/vqgan_runs/brain_internal__sp128x128x96/checkpoints/best-97-7056-0.0621.ckpt'
+
+seed: 1
+
+# Latent = 8 x 48 x 64 x 64 (f,h,w) from 96x128x128 input, downsample [2,2,2].
+diffusion_img_size: 64      # h = w
+diffusion_depth_size: 48    # f (non-cubic)
 diffusion_num_channels: 8
 
-vol_size_mm: [400, 400, 400]
-det_size_mm: 400
+# Latent standardization -> x0 ~ N(0,1). Tied to vqgan_ckpt above; re-measure if it
+# changes. Replaces the old codebook min/max normalization, which gave std 0.072
+# because ~95% of the 4096 codes are dead (perplexity ~220) and set the min/max.
+latent_mean: -0.1517
+latent_std: 2.3610
 
+# Cone-beam geometry for Fusion. MUST match data/generate_drr_brain.py.
+fusion:
+  num_views: 5
+  total_deg: 180.0
+  start_deg: 0.0
+  endpoint: false           # -> [0,36,72,108,144] deg
+  sdd: 1000.0
+  sid: 500.0
+  det: 256
+  delx: 3.0
+  vol_spacing: 4.0          # latent voxel mm (2x the 2mm CT)
 
+dim: 192                    # ~298M-param U-Net; ~46GB/2-sample fp32, sized for 4x96GB
 dim_mults: [1, 2, 4, 8]
 
 
-batch_size: 4
-train_lr: 3e-4            
+batch_size: 2               # per GPU; dim=192 attention OOMs above ~3 on 96GB
+train_lr: 1e-4              # was 3e-4; grads are now 3x larger (accum double-divide fixed)
 train_num_steps: 150000
-gradient_accumulate_every: 2
+gradient_accumulate_every: 3   # eff. batch = 2 x 3 GPUs x 3 = 18
+max_grad_norm: 1.0          # unclipped grads blew the run up to NaN at ~step 8k
 ema_decay: 0.995
-amp: False
+amp: True                   # bf16 on Blackwell
 
 
 timesteps: 1000
@@ -30,7 +51,7 @@ objective: pred_noise
 cond_scale: 2.0
 
 
-results_folder: './results'
+results_folder: '/home/user/Desktop/tomoray/ddpm_runs'   # adjacent to vqgan_runs
 results_folder_postfix: 'diffusion_experiment'
 load_milestone: -1 
 save_and_sample_every: 1000
