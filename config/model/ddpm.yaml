@@ -48,7 +48,8 @@ timesteps: 1000
 sampling_timesteps: 250
 loss_type: l2
 objective: pred_noise
-cond_scale: 3.0            # measured optimum: -18% vol MAE, -35% reproj vs 2.0
+cond_scale: 2.0            # brain-HU optimum (n=12, flat 1.0-2.0); 3.0 wins only on
+                           # re-projection/global MAE, which favour over-guidance
 
 
 results_folder: '/home/user/Desktop/tomoray/ddpm_runs'   # adjacent to vqgan_runs

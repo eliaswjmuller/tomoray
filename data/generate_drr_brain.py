@@ -81,6 +81,13 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--spatial-size", type=int, nargs=3, default=[128, 128, 96])
     ap.add_argument("--vol-spacing", type=float, default=2.0, help="CT voxel mm (latent = 2x)")
+    ap.add_argument("--hu-min", type=float, default=-300.0,
+                    help="TARGET window low (HU) -- what the model reconstructs")
+    ap.add_argument("--hu-max", type=float, default=1000.0, help="TARGET window high (HU)")
+    ap.add_argument("--render-hu-min", type=float, default=-300.0,
+                    help="window the DRRs are rendered from; keep wide so bone attenuates")
+    ap.add_argument("--render-hu-max", type=float, default=1000.0,
+                    help="window the DRRs are rendered from")
     ap.add_argument("--num-views", type=int, default=5)
     ap.add_argument("--total-deg", type=float, default=180.0)
     ap.add_argument("--start-deg", type=float, default=0.0)
@@ -98,8 +105,12 @@ def main():
     ss = tuple(args.spatial_size)
     angles = view_angles(args.num_views, args.total_deg, args.start_deg, args.endpoint)
     os.makedirs(args.out, exist_ok=True)
+    # hu_window is recorded so downstream can convert [-1,1] back to HU. Without it
+    # a re-windowed render is indistinguishable from the old one on disk.
     geom_meta = dict(sdd=args.sdd, sid=args.sid, det=args.det, delx=args.delx,
-                     angles=angles, vol_spacing=args.vol_spacing)
+                     angles=angles, vol_spacing=args.vol_spacing,
+                     hu_window=(args.hu_min, args.hu_max),
+                     render_hu_window=(args.render_hu_min, args.render_hu_max))
 
     splits = resolve_splits(p["root_dir"], p["subset_csv"], p["by_patient"], args.seed)
     all_rel = splits["train"] + splits["val"] + splits["test"]
@@ -109,21 +120,43 @@ def main():
         splits = {k: [r for r in v if r in keep] for k, v in splits.items()}
 
     render_rel = all_rel[args.shard::args.nshards]   # this worker's slice (splits.json stays full)
+    # DECOUPLED: the volume is loaded in the RENDER window, DRRs are cast through that
+    # (bone is what attenuates X-rays and makes the inverse problem solvable), and the
+    # stored target is re-windowed to the narrower TARGET window afterwards. Windowing
+    # the volume the DRRs are cast through would gut the conditioning.
+    if args.hu_min < args.render_hu_min or args.hu_max > args.render_hu_max:
+        raise SystemExit(
+            f"target window [{args.hu_min},{args.hu_max}] is not contained in the render "
+            f"window [{args.render_hu_min},{args.render_hu_max}]; the re-windowing below "
+            f"would need HU the render window already clipped away.")
+
     ds = VerseDataset(p["root_dir"], split="test", spatial_size=ss, data_list=render_rel,
-                      remove_hardware=not args.keep_hardware)
+                      remove_hardware=not args.keep_hardware,
+                      hu_min=args.render_hu_min, hu_max=args.render_hu_max)
+    decoupled = (args.hu_min, args.hu_max) != (args.render_hu_min, args.render_hu_max)
     print(f"[{args.source}] rendering {len(ds)} volumes -> {args.out}  angles(deg)="
           f"{[round(np.rad2deg(a), 1) for a in angles]}")
+    print(f"    DRRs cast through [{args.render_hu_min:.0f},{args.render_hu_max:.0f}] HU"
+          f" | target stored as [{args.hu_min:.0f},{args.hu_max:.0f}] HU"
+          f"{'  (DECOUPLED)' if decoupled else ''}")
+
+    def rewindow(v):
+        """[-1,1] over the render window -> [-1,1] over the target window. Exact: the
+        target range is contained in the render range, so no clipped HU is needed."""
+        hu = (v + 1.0) / 2.0 * (args.render_hu_max - args.render_hu_min) + args.render_hu_min
+        return ((hu - args.hu_min) / (args.hu_max - args.hu_min) * 2.0 - 1.0).clamp(-1, 1)
 
     for i in range(len(ds)):
         name = ds.get_filename(i)
         out_pickle = os.path.join(args.out, f"{name}.pickle")
         if os.path.exists(out_pickle):                      # resumable
             continue
-        img = ds[i]["image"]                                # (1,D,H,W) in [-1,1]
-        density = ((img[0] + 1.0) / 2.0).clamp(0, 1)        # (D,H,W) >=0
+        img = ds[i]["image"]                                # (1,D,H,W), render window
+        density = ((img[0] + 1.0) / 2.0).clamp(0, 1)        # (D,H,W) >=0, wide -> bone kept
         projs, raw_lo, raw_hi = render_views(density, args.vol_spacing, angles,
                                             args.sdd, args.sid, args.det, args.delx, device)
-        data = {"image": img.numpy().astype(np.float16),        # loader upcasts; ~2x smaller
+        target = rewindow(img) if decoupled else img        # what the model reconstructs
+        data = {"image": target.numpy().astype(np.float16),     # loader upcasts; ~2x smaller
                 "projections": projs.astype(np.float16),
                 "proj_raw_range": (raw_lo, raw_hi),   # so the [0,1] scaling is invertible
                 "angles": np.array(angles, np.float32),

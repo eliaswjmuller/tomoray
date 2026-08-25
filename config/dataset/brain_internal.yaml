@@ -9,3 +9,8 @@ split_by_patient: true      # group NORM/HEM/plain variants of a patient into on
 
 image_channels: 1
 spatial_size: [128, 128, 96]   # match the pretrained model's input grid
+
+# intensity window mapped onto [-1,1]. Sets what fraction of the range brain
+# contrast occupies, and therefore what the reconstruction loss prices.
+hu_min: -300
+hu_max: 1000

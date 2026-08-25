@@ -8,10 +8,10 @@ brain parenchyma contrast into ~9% of the dynamic range:
 If parenchyma texture (std inside the brain band) collapses on round-trip, no
 amount of diffusion training recovers it and the window is the bottleneck.
 
-Metrics are restricted to an anatomical intracranial mask (evaluation/brain_mask.py).
-Global PSNR/SSIM are printed for reference only: a baseline that reproduces air, skull
-and head holder perfectly and fills the brain with a flat constant scores 39.8 dB /
-0.989, so global numbers cannot tell success from failure.
+Reported in HU via evaluation/hu_metrics.py, so the numbers stay comparable when the
+intensity window changes. MAE is decomposed into slope / bias / residual: a single MAE
+conflates "recovers less true variation" with "systematically offset", which are
+different failures with different fixes.
 
 Overrides: +n_cases=24 +split=val
 """
@@ -27,19 +27,10 @@ torch.serialization.add_safe_globals([MetaTensor])
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ddpm.diffusion import Unet3D, GaussianDiffusion
-from evaluation.brain_mask import intracranial_mask, brain_report
-from get_ddpm_dataset import get_dataset
-
-HU_LO, HU_HI = -300.0, 1000.0
-
-
-def to_hu(v):
-    return (v + 1.0) / 2.0 * (HU_HI - HU_LO) + HU_LO
-
-
-def hu_to_v(hu):
-    return (hu - HU_LO) / (HU_HI - HU_LO) * 2.0 - 1.0
-
+from evaluation.hu_metrics import (to_hu, band_stats, hu_profile,
+                                   format_band, format_profile,
+                                   GM_WM_CONTRAST, CORE_LO, CORE_HI)
+from get_ddpm_dataset import get_dataset, get_hu_window, indices_by_source
 
 @hydra.main(version_base=None, config_path="../config", config_name="base_cfg")
 def run(cfg: DictConfig):
@@ -63,17 +54,25 @@ def run(cfg: DictConfig):
     vq = diffusion.vqgan
     vq.eval()
 
+    win = get_hu_window(cfg)          # [-1,1] -> HU, from the pickles
     _, val_ds, _ = get_dataset(cfg)
-    idxs = np.linspace(0, len(val_ds) - 1, n_cases).astype(int).tolist()
-    print(f"val={len(val_ds)}  round-tripping {n_cases} volumes\n")
+    # n_cases PER COHORT: drawing uniformly over the concatenation would give the
+    # small cohort ~2% of the cases, i.e. usually none.
+    by_src = indices_by_source(val_ds)
+    plan = []
+    for src, idx in by_src.items():
+        take = np.linspace(0, len(idx) - 1, min(n_cases, len(idx))).astype(int)
+        plan += [(src, idx[t]) for t in take]
+    print(f"val={len(val_ds)}  cohorts: "
+          + ", ".join(f"{k}={len(v)}" for k, v in by_src.items()))
+    print(f"round-tripping {n_cases} per cohort ({len(plan)} total)\n")
 
-    # brain parenchyma band, generous: 0-80 HU
-    v_lo, v_hi = hu_to_v(0.0), hu_to_v(80.0)
-    print(f"brain band in [-1,1]: [{v_lo:.4f}, {v_hi:.4f}]  "
-          f"(width {v_hi - v_lo:.4f} = {100*(v_hi-v_lo)/2:.1f}% of dynamic range)\n")
+    print(f"window [{win[0]:.0f},{win[1]:.0f}] HU: the 0-80 HU band is "
+          f"{100*80/(win[1]-win[0]):.1f}% of the range -- that fraction is what\n"
+          f"the reconstruction loss prices\n")
 
-    rows = []
-    for c, idx in enumerate(idxs):
+    rows, prof, cores, srcs = [], [], [], []
+    for c, (src, idx) in enumerate(plan):
         x = val_ds[idx]["image"].unsqueeze(0).to(device)       # (1,1,D,H,W)
         with torch.no_grad():
             h = vq.encode(x, quantize=False, include_embeddings=True)
@@ -85,43 +84,62 @@ def run(cfg: DictConfig):
         mse = ((r - x) ** 2).mean().item()
         psnr = 10 * np.log10(4.0 / max(mse, 1e-12))            # data range = 2
 
-        # ANATOMICAL intracranial mask, not an intensity band: an intensity band also
-        # selects scalp, muscle and orbital fat, which are not what we are measuring.
-        xn = x[0, 0].cpu().numpy()
-        rn = r[0, 0].cpu().numpy()
-        rep = brain_report(xn, rn)
-        frac, mae_b = rep["brain_frac"], rep["brain_mae_hu"]
-        hu_std_real, hu_std_rec = rep["contrast_real_hu"], rep["contrast_rec_hu"]
-
-        rows.append((mae, psnr, mae_b, hu_std_real, hu_std_rec, frac,
-                     rep["brain_psnr"], rep["brain_ssim"],
-                     rep["global_psnr"], rep["global_ssim"]))
-        print(f"[{c+1:2d}/{n_cases}] idx={idx:5d}  global PSNR={psnr:5.2f}dB | "
-              f"BRAIN MAE={mae_b:5.2f}HU PSNR={rep['brain_psnr']:5.2f}dB "
-              f"SSIM={rep['brain_ssim']:.4f} | contrast {hu_std_real:5.2f}->{hu_std_rec:5.2f}HU "
-              f"({100*frac:.1f}% vox)")
+        xh = to_hu(x[0, 0].cpu().numpy(), *win)
+        rh = to_hu(r[0, 0].cpu().numpy(), *win)
+        st = band_stats(xh, rh, win=win)
+        core = band_stats(xh, rh, CORE_LO, CORE_HI, win=win)
+        cores.append((core['mae'], core['slope'], core['bias'], core['resid']))
+        prof.append(hu_profile(xh, rh))
+        rows.append((mae, psnr, st["mae"], st["slope"], st["bias"], st["resid"],
+                     st["frac"]))
+        srcs.append(src)
+        print(f"[{c+1:2d}/{len(plan)}] {src:<10} idx={idx:5d}  "
+              + format_band("", st))
 
     a = np.array(rows, dtype=np.float64)
+    C_all = np.array(cores, dtype=np.float64)
+    S = np.array(srcs)
     print("\n" + "=" * 72)
+    print("PER COHORT  (band 0-80 HU | core 20-40 HU)")
+    print("=" * 72)
+    print(f"  {'cohort':<12} {'n':>4} {'band MAE':>9} {'a':>7} {'bias':>8} "
+          f"{'core MAE':>9} {'core a':>7} {'core bias':>10}")
+    for src in dict.fromkeys(srcs):
+        m = S == src
+        print(f"  {src:<12} {m.sum():>4} {a[m,2].mean():>8.2f}HU {a[m,3].mean():>7.3f} "
+              f"{a[m,4].mean():>+7.2f}HU {np.nanmean(C_all[m,0]):>8.2f}HU "
+              f"{np.nanmean(C_all[m,1]):>7.3f} {np.nanmean(C_all[m,2]):>+9.2f}HU")
+    print()
+    print("=" * 72)
     print("VQGAN ROUND-TRIP CEILING  (no diffusion; upper bound on the pipeline)")
     print("=" * 72)
-    print(f"  BRAIN (intracranial mask, {100*a[:,5].mean():.1f}% of volume)")
-    print(f"     MAE  = {a[:,2].mean():6.2f} HU  +- {a[:,2].std():.2f}")
-    print(f"     PSNR = {a[:,6].mean():6.2f} dB")
-    print(f"     SSIM = {a[:,7].mean():6.4f}")
+    print(f"  BAND 0-80 HU  ({100*a[:,6].mean():.1f}% of voxels, selected on ground truth)")
+    print(f"     MAE      = {a[:,2].mean():6.2f} HU  +- {a[:,2].std():.2f}")
+    print(f"     slope a  = {a[:,3].mean():6.3f}      (1.0 = variation fully recovered)")
+    print(f"     bias  b  = {a[:,4].mean():+6.2f} HU   (0.0 = no systematic offset)")
+    print(f"     resid s  = {a[:,5].mean():6.2f} HU   (0.0 = nothing unexplained)")
     print()
-    print(f"  global (for reference only -- inflated, do not report as the headline)")
-    print(f"     PSNR = {a[:,8].mean():6.2f} dB   SSIM = {a[:,9].mean():6.4f}")
-    print(f"     a brain-blind constant fill already scores ~39.8 dB / 0.989 here")
+    print("  error by ground-truth HU (no mask, no tuning):")
+    P = np.array([[r[4] for r in c] for c in prof], dtype=np.float64)
+    edges = [(r[0], r[1]) for r in prof[0]]
+    fr = np.array([[r[3] for r in c] for c in prof], dtype=np.float64)
+    print(f"  {'HU bin':>16} {'% vox':>7} {'MAE (HU)':>10}")
+    for k, (lo, hi) in enumerate(edges):
+        print(f"  {f'[{lo},{hi})':>16} {100*np.nanmean(fr[:,k]):>6.1f}% "
+              f"{np.nanmean(P[:,k]):>10.2f}")
     print()
-    sr, sc = a[:, 3].mean(), a[:, 4].mean()
-    print(f"  parenchyma contrast (std within 0-80 HU band):")
-    print(f"     real        = {sr:6.2f} HU")
-    print(f"     round-trip  = {sc:6.2f} HU")
-    print(f"     retained    = {100*sc/max(sr,1e-9):5.1f}%")
+    print(f"  global MAE {a[:,0].mean()/2*(win[1]-win[0]):6.2f} HU, PSNR {a[:,1].mean():.2f} dB "
+          f"-- reference only, dominated by bone and air")
     print()
-    print(f"  reference: grey-white matter difference is ~15 HU")
-    print(f"  brain MAE is {100*a[:,2].mean()/15:.0f}% of the contrast it must preserve")
+    C = C_all
+    print(f"  CORE {CORE_LO:.0f}-{CORE_HI:.0f} HU (grey/white matter; inside every window, "
+          f"so comparable across them)")
+    print(f"     MAE={np.nanmean(C[:,0]):6.2f} HU  a={np.nanmean(C[:,1]):5.3f}  "
+          f"b={np.nanmean(C[:,2]):+6.2f} HU  sigma={np.nanmean(C[:,3]):6.2f} HU")
+    print()
+    print(f"  reference: grey-white matter difference is ~{GM_WM_CONTRAST:.0f} HU")
+    print(f"  band MAE is {100*a[:,2].mean()/GM_WM_CONTRAST:.0f}% of the contrast "
+          f"it must preserve")
 
 
 if __name__ == "__main__":

@@ -11,3 +11,8 @@ split_by_patient: true
 
 image_channels: 1
 spatial_size: [128, 128, 96]
+
+# intensity window mapped onto [-1,1]. Sets what fraction of the range brain
+# contrast occupies, and therefore what the reconstruction loss prices.
+hu_min: -300
+hu_max: 1000

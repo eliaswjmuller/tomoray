@@ -119,6 +119,9 @@ def get_dataset(cfg):
     )
 
     def make(names, split):
-        return VerseDataset(root_dir=root_dir, split=split, spatial_size=spatial_size, data_list=names)
+        return VerseDataset(root_dir=root_dir, split=split, spatial_size=spatial_size,
+                            data_list=names,
+                            hu_min=float(cfg.dataset.get('hu_min', -300.0)),
+                            hu_max=float(cfg.dataset.get('hu_max', 1000.0)))
 
     return make(splits["train"], "train"), make(splits["val"], "val"), make(splits.get("test", []), "test")

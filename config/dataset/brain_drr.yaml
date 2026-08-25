@@ -4,3 +4,16 @@ name: brain_drr
 folders:
   - /home/user/Desktop/tomoray/datasets/drr_brain/rsna_tilt
   - /home/user/Desktop/tomoray/datasets/drr_brain/internal
+
+# authoritative value is recorded in each pickle's geometry.hu_window;
+# these are the expected values, verified at load time
+hu_min: -300
+hu_max: 1000
+
+# Share of drawn training samples per cohort. Unlisted cohorts split the remainder in
+# proportion to their size. Uniform sampling would give internal 3.1% (436 of 14174),
+# but internal is the target domain and RSNA is the augmentation.
+# Kept modest: the DRR loader does no augmentation, so a high share just replays the
+# same 436 volumes and invites memorisation.
+sample_shares:
+  internal: 0.12

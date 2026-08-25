@@ -16,7 +16,7 @@ sys.path.append(parent_dir)
 
 from ddpm.diffusion import Unet3D, GaussianDiffusion, Trainer
 from features_fusion.fusion import Fusion
-from get_ddpm_dataset import get_dataset
+from get_ddpm_dataset import get_dataset, sample_weights
 
 @hydra.main(version_base=None, config_path="../config", config_name="base_cfg")
 def run(cfg: DictConfig):
@@ -111,8 +111,8 @@ def run(cfg: DictConfig):
         save_and_sample_every=cfg.model.save_and_sample_every,
         results_folder=cfg.model.results_folder,
         num_workers=cfg.model.num_workers,
-        debug_overfit=False
-
+        debug_overfit=False,
+        train_sample_weights=sample_weights(train_dataset, cfg),
     )
 
     ckpt_dir = os.path.join(cfg.model.results_folder, 'checkpoints')

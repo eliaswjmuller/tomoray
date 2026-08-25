@@ -23,8 +23,17 @@ from data.support_removal import RemoveSupportd
 
 class VerseDataset(Dataset):
     def __init__(self, root_dir, split="train", spatial_size=(128, 128, 128), data_list=None,
-                 remove_hardware=True):
+                 remove_hardware=True, hu_min=-300.0, hu_max=1000.0):
+        """hu_min/hu_max set the intensity window mapped onto [-1,1].
+
+        This is the single most consequential preprocessing choice in the pipeline:
+        it decides what fraction of the dynamic range brain contrast occupies, and
+        therefore what the reconstruction loss actually prices. It also fixes the
+        [-1,1] -> HU mapping, so anything that reports HU must know it -- which is
+        why generate_drr_brain.py records it in every pickle.
+        """
         self.root_dir = root_dir
+        self.hu_window = (float(hu_min), float(hu_max))
 
         if data_list is not None:
             self.image_paths = [os.path.join(root_dir, f) for f in data_list]
@@ -45,9 +54,9 @@ class VerseDataset(Dataset):
             # learns it will paint a cradle on external data that has none
             *([RemoveSupportd(keys=["image"])] if remove_hardware else []),
             ScaleIntensityRanged(
-                keys=["image"], 
-                a_min=-300, a_max=1000, 
-                b_min=-1.0, b_max=1.0, 
+                keys=["image"],
+                a_min=hu_min, a_max=hu_max,
+                b_min=-1.0, b_max=1.0,
                 clip=True
             ),
             Resized(keys=["image"], spatial_size=spatial_size, mode="trilinear"),

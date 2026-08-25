@@ -29,9 +29,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ddpm.diffusion import Unet3D, GaussianDiffusion
 from features_fusion.fusion import Fusion
-from get_ddpm_dataset import get_dataset
+from get_ddpm_dataset import get_dataset, get_hu_window, indices_by_source
 from data.generate_drr_brain import render_views
-from evaluation.brain_mask import intracranial_mask, hu_mae, masked_psnr
+from evaluation.hu_metrics import to_hu, band_stats
 
 
 @hydra.main(version_base=None, config_path="../config", config_name="base_cfg")
@@ -66,9 +66,20 @@ def run(cfg: DictConfig):
     diffusion.eval(); fusion.eval()
     print(f"loaded {ck}  step={d['step']}")
 
+    win = get_hu_window(cfg)
     _, val_ds, _ = get_dataset(cfg)
-    idxs = np.linspace(0, len(val_ds) - 1, n_cases + 1).astype(int).tolist()
-    cases, nxt = idxs[:n_cases], idxs[1:n_cases + 1]     # nxt = donor for the swap
+    # n_cases PER COHORT; the swap donor is drawn from the SAME cohort so the control
+    # isolates "wrong patient", not "wrong scanner".
+    by_src = indices_by_source(val_ds)
+    cases, nxt, case_src = [], [], []
+    for src, idx in by_src.items():
+        k = min(n_cases, len(idx) - 1)
+        take = np.linspace(0, len(idx) - 2, k).astype(int)
+        cases += [idx[t] for t in take]
+        nxt += [idx[t + 1] for t in take]
+        case_src += [src] * k
+    print(f"cohorts: " + ", ".join(f"{k}={len(v)}" for k, v in by_src.items())
+          + f"  -> {len(cases)} cases ({n_cases}/cohort)")
 
     # CT voxel mm, NOT fz.vol_spacing (=4.0, the latent grid). The stored DRRs
     # carry vol_spacing=2.0; using 4.0 doubles the volume and breaks the geometry.
@@ -87,7 +98,8 @@ def run(cfg: DictConfig):
              ("cfg1.5", 1.5, False), ("cfg2.0", 2.0, False),
              ("cfg2.5", 2.5, False), ("cfg3.0", 3.0, False),
              ("cfg4.0", 4.0, False), ("swap2.0", 2.0, True)]
-    res = {k: {"vol": [], "rep": [], "bmae": [], "bpsnr": []} for k, _, _ in conds}
+    res = {k: {"vol": [], "rep": [], "bmae": [], "slope": [], "bias": [],
+           "src": []} for k, _, _ in conds}
     floor = []
 
     for c, (idx, jdx) in enumerate(zip(cases, nxt)):
@@ -103,15 +115,15 @@ def run(cfg: DictConfig):
         f = (p_real - p_in).abs().mean().item()
         floor.append(f)
 
-        # mask comes from the REAL volume, so every condition is scored on the
+        # band is selected on the REAL volume, so every condition is scored on the
         # same voxels and the comparison stays like-for-like
-        bmask = intracranial_mask(img[0, 0].cpu().numpy())
+        real_hu = to_hu(img[0, 0].cpu().numpy(), *win)
 
         it2 = val_ds[jdx]
         pin2 = it2["projections"].unsqueeze(0).to(device)
         ang2 = it2["angles"].unsqueeze(0).to(device)
 
-        line = [f"[{c+1}/{n_cases}] idx={idx:5d} floor={f:.4f}"]
+        line = [f"[{c+1}/{len(cases)}] {case_src[c]:<10} idx={idx:5d} floor={f:.4f}"]
         for name, cs, swap in conds:
             with torch.no_grad():
                 co = fusion(pin2, ang2) if swap else fusion(pin, ang)
@@ -121,35 +133,50 @@ def run(cfg: DictConfig):
             vmae = (g - img).abs().mean().item()
             # always score against THIS case's real X-rays
             rmae = (reproject(g.cpu(), angles_np) - p_in).abs().mean().item()
-            gn, xn = g[0, 0].cpu().numpy(), img[0, 0].cpu().numpy()
-            if bmask.any():
-                bmae = hu_mae(float(np.abs(gn - xn)[bmask].mean()))
-                bpsnr = masked_psnr(xn, gn, bmask)
-            else:
-                bmae = bpsnr = float("nan")
+            st = band_stats(real_hu, to_hu(g[0, 0].cpu().numpy(), *win), win=win)
             res[name]["vol"].append(vmae)
             res[name]["rep"].append(rmae)
-            res[name]["bmae"].append(bmae)
-            res[name]["bpsnr"].append(bpsnr)
-            line.append(f"{name}: brain={bmae:.1f}HU rep={rmae:.4f}")
+            res[name]["bmae"].append(st["mae"])
+            res[name]["slope"].append(st["slope"])
+            res[name]["bias"].append(st["bias"])
+            res[name]["src"].append(case_src[c])
+            line.append(f"{name}: MAE={st['mae']:.1f} a={st['slope']:.2f} "
+                        f"b={st['bias']:+.0f} rep={rmae:.4f}")
         print("  ".join(line), flush=True)
 
     print("\n" + "=" * 78)
     print(f"RE-PROJECTION CONSISTENCY + ABLATION   n={n_cases}  step={d['step']}")
     print("=" * 78)
-    print(f"{'condition':<10} {'brain MAE':>11} {'brain PSNR':>11} "
-          f"{'vol MAE':>10} {'reproj MAE':>18}   note")
+    print(f"{'condition':<10} {'band MAE':>10} {'slope a':>9} {'bias b':>9} "
+          f"{'reproj MAE':>18}   note")
     fl = np.array(floor)
-    print(f"{'-- floor':<10} {'':>11} {'':>11} {'':>10} {fl.mean():>10.4f} +-{fl.std():.4f}   "
+    print(f"{'-- floor':<10} {'':>10} {'':>9} {'':>9} {fl.mean():>10.4f} +-{fl.std():.4f}   "
           f"real volume re-rendered")
     for name, _, _ in conds:
         v = np.array(res[name]["vol"]); r = np.array(res[name]["rep"])
-        bm = np.array(res[name]["bmae"]); bp = np.array(res[name]["bpsnr"])
+        bm = np.array(res[name]["bmae"]); sl = np.array(res[name]["slope"])
+        bi = np.array(res[name]["bias"])
         note = {"cfg0.0": "PRIOR ONLY (floor for conditioning)",
                 "swap2.0": "WRONG X-rays (control)",
                 "cfg2.0": "<- what training used"}.get(name, "")
-        print(f"{name:<10} {np.nanmean(bm):>8.2f}HU {np.nanmean(bp):>9.2f}dB "
-              f"{v.mean():>10.4f} {r.mean():>10.4f} +-{r.std():.4f}   {note}")
+        print(f"{name:<10} {np.nanmean(bm):>8.2f}HU {np.nanmean(sl):>9.3f} "
+              f"{np.nanmean(bi):>+8.2f}HU {r.mean():>10.4f} +-{r.std():.4f}   {note}")
+
+    print("\n" + "=" * 78)
+    print("PER COHORT   band 0-80 HU")
+    print("=" * 78)
+    srcs = list(dict.fromkeys(case_src))
+    print(f"{'condition':<10}" + "".join(f"{s2 + ' MAE':>16}" for s2 in srcs)
+          + "".join(f"{s2 + ' reproj':>16}" for s2 in srcs))
+    for name, _, _ in conds:
+        S = np.array(res[name]["src"])
+        bm = np.array(res[name]["bmae"]); r = np.array(res[name]["rep"])
+        row = f"{name:<10}"
+        for s2 in srcs:
+            row += f"{np.nanmean(bm[S == s2]):>13.2f}HU"
+        for s2 in srcs:
+            row += f"{np.nanmean(r[S == s2]):>16.4f}"
+        print(row)
 
     b, p = np.array(res["cfg2.0"]["rep"]), np.array(res["cfg0.0"]["rep"])
     s = np.array(res["swap2.0"]["rep"])

@@ -24,7 +24,7 @@ from einops_exts import check_shape, rearrange_many
 
 
 from rotary_embedding_torch import RotaryEmbedding
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import matplotlib.pyplot as plt
 
 from vq_gan_3d.model.vqgan import VQGAN
@@ -976,7 +976,8 @@ class Trainer(object):
         max_grad_norm=None,
         num_workers=20,
         use_tensorboard=True,
-        debug_overfit=True
+        debug_overfit=True,
+        train_sample_weights=None
     ):
         super().__init__()
 
@@ -1014,7 +1015,7 @@ class Trainer(object):
         self.cfg = cfg
         # sampling guidance strength; measured optimum is 3.0 (monotone to 3.0,
         # flat at 4.0). Was hardcoded 2.0 in three places.
-        self.cond_scale = float(cfg.model.get('cond_scale', 3.0))
+        self.cond_scale = float(cfg.model.get('cond_scale', 2.0))
         self.debug_overfit = debug_overfit
 
         self.writer = None
@@ -1030,13 +1031,23 @@ class Trainer(object):
             print(f'found {len(self.ds)} CTs.')
         assert len(self.ds) > 0, 'need to have at least 1 CT to start training'
 
+        # cohort-weighted sampling: uniform shuffling over a concatenated dataset
+        # gives the smallest cohort a share equal to its size fraction, which is not
+        # what you want when that cohort is the target domain.
+        sampler = None
+        if train_sample_weights is not None:
+            sampler = WeightedRandomSampler(train_sample_weights,
+                                            num_samples=len(self.ds),
+                                            replacement=True)
+            if self.is_main:
+                print(f"weighted sampler active over {len(self.ds)} samples")
         dl = DataLoader(
             self.ds,
             batch_size=train_batch_size,
-            shuffle=True,
+            shuffle=(sampler is None),
+            sampler=sampler,
             pin_memory=True,
             num_workers=num_workers,
-
         )
     
         val_dl = DataLoader(
