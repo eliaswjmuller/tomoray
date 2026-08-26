@@ -3,8 +3,10 @@ diffusion: GaussianDiffusion
 denoising_fn: Unet3D
 
 
-# Fine-tuned brain VQGAN (internal CTs). DDPM lives in its latent space.
-vqgan_ckpt: '/home/user/Desktop/tomoray/vqgan_runs/brain_internal__sp128x128x96/checkpoints/best-97-7056-0.0621.ckpt'
+# Brain-window VQGAN, internal fine-tune (frozen 2026-08-26 at epoch 561, the measured
+# plateau). Window [0,80]. Internal TEST core MAE 3.75 HU, slope 0.935, sigma 5.64;
+# rsna 2.17 HU. DDPM lives in its latent space.
+vqgan_ckpt: '/home/user/Desktop/tomoray/vqgan_runs/internal_w0_80_from_ep77__sp128x128x96/checkpoints/best-561-40464-0.0661.ckpt'
 
 seed: 1
 
@@ -16,8 +18,11 @@ diffusion_num_channels: 8
 # Latent standardization -> x0 ~ N(0,1). Tied to vqgan_ckpt above; re-measure if it
 # changes. Replaces the old codebook min/max normalization, which gave std 0.072
 # because ~95% of the 4096 codes are dead (perplexity ~220) and set the min/max.
-latent_mean: -0.1517
-latent_std: 2.3610
+# Re-measured 2026-08-26 over 48 volumes of the [0,80] DRR set for the checkpoint above.
+# The old wide-window values were mean -0.1517 / std 2.3610 -- std is off by 2.3x, which
+# would have silently rescaled the diffusion target rather than raising an error.
+latent_mean: -0.2772
+latent_std: 5.5407
 
 # Cone-beam geometry for Fusion. MUST match data/generate_drr_brain.py.
 fusion:

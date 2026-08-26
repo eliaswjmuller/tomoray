@@ -23,6 +23,22 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 from vq_gan_3d.model.vqgan import VQGAN
 from train.get_vqgan_dataset import get_dataset
+
+# PyTorch 2.6 flipped torch.load's weights_only default to True. Lightning's resume path
+# (trainer.fit(ckpt_path=...)) calls torch.load internally, so the flag cannot be passed
+# there, and our checkpoints carry the hydra cfg plus numpy/MetaTensor objects. These are
+# our own files; restore the old default. finetune_from already passes weights_only=False.
+_torch_load = torch.load
+
+
+def _torch_load_compat(*args, **kwargs):
+    # Lightning passes weights_only=True explicitly, so setdefault is not enough.
+    kwargs["weights_only"] = False
+    return _torch_load(*args, **kwargs)
+
+
+torch.load = _torch_load_compat
+
 # from train.callbacks import ImageLogger  # optional recon previews; re-enable if desired
 
 
