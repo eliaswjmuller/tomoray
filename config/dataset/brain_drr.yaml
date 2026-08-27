@@ -18,5 +18,6 @@ hu_max: 80
 # but internal is the target domain and RSNA is the augmentation.
 # Kept modest: the DRR loader does no augmentation, so a high share just replays the
 # same 436 volumes and invites memorisation.
+# DRR folder basenames: this key must follow it
 sample_shares:
-  internal: 0.12
+  internal_w0_80: 0.12

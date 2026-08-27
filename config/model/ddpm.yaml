@@ -1,4 +1,4 @@
-name: diffusion_brain_rsna+internal_cond_5view_dim192_stdlatent
+name: diffusion_brain_w0_80_cond_5view_dim192
 diffusion: GaussianDiffusion
 denoising_fn: Unet3D
 
@@ -42,7 +42,8 @@ dim_mults: [1, 2, 4, 8]
 
 batch_size: 2               # per GPU; dim=192 attention OOMs above ~3 on 96GB
 train_lr: 1e-4              # was 3e-4; grads are now 3x larger (accum double-divide fixed)
-train_num_steps: 150000
+train_num_steps: 100000   # plan says ~80k (flat from 70k; 70k->150k moved val 0.0018);
+                          # 100k leaves headroom, and it can be stopped early
 gradient_accumulate_every: 3   # eff. batch = 2 x 3 GPUs x 3 = 18
 max_grad_norm: 1.0          # unclipped grads blew the run up to NaN at ~step 8k
 ema_decay: 0.995
