@@ -31,7 +31,7 @@ from ddpm.diffusion import Unet3D, GaussianDiffusion
 from features_fusion.fusion import Fusion
 from get_ddpm_dataset import get_dataset, get_hu_window, indices_by_source
 from data.generate_drr_brain import render_views
-from evaluation.hu_metrics import to_hu, band_stats
+from evaluation.hu_metrics import to_hu, band_stats, CORE_LO, CORE_HI
 
 
 @hydra.main(version_base=None, config_path="../config", config_name="base_cfg")
@@ -99,6 +99,7 @@ def run(cfg: DictConfig):
              ("cfg2.5", 2.5, False), ("cfg3.0", 3.0, False),
              ("cfg4.0", 4.0, False), ("swap2.0", 2.0, True)]
     res = {k: {"vol": [], "rep": [], "bmae": [], "slope": [], "bias": [],
+           "cmae": [], "cslope": [], "cbias": [], "cresid": [],
            "src": []} for k, _, _ in conds}
     floor = []
 
@@ -133,15 +134,23 @@ def run(cfg: DictConfig):
             vmae = (g - img).abs().mean().item()
             # always score against THIS case's real X-rays
             rmae = (reproject(g.cpu(), angles_np) - p_in).abs().mean().item()
-            st = band_stats(real_hu, to_hu(g[0, 0].cpu().numpy(), *win), win=win)
+            gen_hu = to_hu(g[0, 0].cpu().numpy(), *win)
+            st = band_stats(real_hu, gen_hu, win=win)
+            # CORE 20-40 = the arc's ranking metric (RUN_PLAN): strictly inside every
+            # candidate window, so it is comparable to the VQGAN ceiling (3.75 HU).
+            sc = band_stats(real_hu, gen_hu, lo=CORE_LO, hi=CORE_HI, win=win)
             res[name]["vol"].append(vmae)
             res[name]["rep"].append(rmae)
             res[name]["bmae"].append(st["mae"])
             res[name]["slope"].append(st["slope"])
             res[name]["bias"].append(st["bias"])
+            res[name]["cmae"].append(sc["mae"])
+            res[name]["cslope"].append(sc["slope"])
+            res[name]["cbias"].append(sc["bias"])
+            res[name]["cresid"].append(sc["resid"])
             res[name]["src"].append(case_src[c])
-            line.append(f"{name}: MAE={st['mae']:.1f} a={st['slope']:.2f} "
-                        f"b={st['bias']:+.0f} rep={rmae:.4f}")
+            line.append(f"{name}: core={sc['mae']:.1f} a={sc['slope']:.2f} "
+                        f"rep={rmae:.4f}")
         print("  ".join(line), flush=True)
 
     print("\n" + "=" * 78)
@@ -161,6 +170,20 @@ def run(cfg: DictConfig):
                 "cfg2.0": "<- what training used"}.get(name, "")
         print(f"{name:<10} {np.nanmean(bm):>8.2f}HU {np.nanmean(sl):>9.3f} "
               f"{np.nanmean(bi):>+8.2f}HU {r.mean():>10.4f} +-{r.std():.4f}   {note}")
+
+    print("\n" + "=" * 78)
+    print(f"CORE 20-40 HU (ranking metric; VQGAN ceiling = 3.75 HU internal)")
+    print("=" * 78)
+    print(f"{'condition':<10} {'core MAE':>10} {'slope a':>9} {'bias b':>9} "
+          f"{'resid s':>9}   note")
+    for name, _, _ in conds:
+        cm = np.array(res[name]["cmae"]); cs = np.array(res[name]["cslope"])
+        cb = np.array(res[name]["cbias"]); cr = np.array(res[name]["cresid"])
+        note = {"cfg0.0": "PRIOR ONLY (floor for conditioning)",
+                "swap2.0": "WRONG X-rays (control)",
+                "cfg2.0": "<- what training used"}.get(name, "")
+        print(f"{name:<10} {np.nanmean(cm):>8.2f}HU {np.nanmean(cs):>9.3f} "
+              f"{np.nanmean(cb):>+8.2f}HU {np.nanmean(cr):>8.2f}HU   {note}")
 
     print("\n" + "=" * 78)
     print("PER COHORT   band 0-80 HU")
@@ -184,6 +207,16 @@ def run(cfg: DictConfig):
           f"reproj error change")
     print(f"  conditional vs swap  : {100*(s.mean()-b.mean())/s.mean():+.1f}%")
     print(f"  headroom above floor : {b.mean()/max(fl.mean(),1e-9):.2f}x")
+
+    # THE GATE: does conditioning buy anything on PARENCHYMA, not on skull?
+    cb_ = np.nanmean(res["cfg2.0"]["cmae"]); cp_ = np.nanmean(res["cfg0.0"]["cmae"])
+    cs_ = np.nanmean(res["swap2.0"]["cmae"])
+    print(f"\n  CORE 20-40 conditioning margin")
+    print(f"    cfg2.0 vs prior only : {100*(cp_-cb_)/cp_:+.1f}%  "
+          f"({cp_:.2f} -> {cb_:.2f} HU)")
+    print(f"    cfg2.0 vs wrong Xray : {100*(cs_-cb_)/cs_:+.1f}%  "
+          f"({cs_:.2f} -> {cb_:.2f} HU)")
+    print("    ~0% on both => conditioning is inert on parenchyma in this window.")
 
 
 if __name__ == "__main__":

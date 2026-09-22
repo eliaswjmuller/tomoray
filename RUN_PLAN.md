@@ -1,5 +1,10 @@
 # Brain-window run plan
 
+> **STATUS: COMPLETE, HISTORICAL.** Part 1 (VQGAN rebuild) and Part 2 (DDPM retrain)
+> both executed; the run finished 2026-08-29. Kept as the record of what was decided and
+> why. For what to do next see `NEXT_STEPS.md`; for the traps see `LESSONS.md`.
+
+
 Self-contained handoff. Goal: the best brain-windowed reconstruction of head CT from
 5 sparse cone-beam DRRs. Strategy — retrain the VQGAN in a brain window (the measured
 bottleneck), then one diffusion run in its latent space.
@@ -329,41 +334,16 @@ Only **one** diffusion run, in the winning latent space.
    win. Beyond that, a data-consistency sampler is the largest remaining idea —
    re-projection error 0.0070 against a floor of exactly 0.0000 is all headroom, and
    diffDRR's differentiable operator is already wired in `eval_reproj.py`.
+   > **Corrected 2026-08-30.** That headroom was a wide-window number. In this arc the
+   > floor is 0.0128, not 0.0000, because the target is windowed while the projections
+   > are not — so `A(x_target) != y_measured` and data consistency is not directly
+   > available. See `NEXT_STEPS.md`, Phase C.8.
 
 ---
 
 # Traps
 
-Each of these produces a plausible-looking result rather than an error.
-
-- **Never window the DRRs.** Bone is what attenuates X-rays and makes the inverse problem
-  solvable. Rendering through a [0,80] volume destroys the conditioning. Already handled
-  by `--render-hu-min/--render-hu-max`; verified DRRs come out bit-identical.
-- **Report HU, never [-1,1].** The window sets that mapping, so identical model quality
-  reads as 9.8 HU or 0.6 HU depending only on the window.
-- **Report per cohort.** The pooled val set is ~98% RSNA, so pooled numbers describe the
-  augmentation domain, not the target.
-- **Global PSNR/SSIM are uninformative here**, in both directions. A brain-blind constant
-  fill scores 39.8 dB / 0.989; meanwhile the VQGAN's brain PSNR exceeds its global PSNR
-  because bone edges dominate. Use the masked HU decomposition.
-- **Don't select guidance on re-projection error.** It measures agreement with the
-  measurements, not accuracy; in an underdetermined problem those diverge, and every
-  global metric prefers over-guidance. `cond_scale` is inference-only — never a training
-  decision.
-- **Latent stats are tied to the checkpoint AND the window.** Re-measure every retrain.
-- **The 0 HU pad is still on disk.** Only the transform pipeline removes it; anything
-  bypassing `VerseDataset` re-inherits it.
-- **`max_steps` counts double.** Manual optimization with two optimizers increments
-  `global_step` twice per batch, so `max_steps` and checkpoint filenames are in doubled
-  units: epoch 50 is `periodic-50-115000`, while TB logs that same epoch at step 56,949.
-  `max_steps=60000` stops at epoch ~26, not ~52.
-- **`val/recon_loss` does not track internal core MAE.** It kept improving through V1
-  epochs 6-12 while internal core MAE went flat and internal slope decayed. It is also in
-  [-1,1] units, so its absolute value is not comparable across windows - only its shape.
-- **Never compare `val/recon_loss` across different `subset_csv`.** A different subset is
-  a different val set. That is how the tilt subset came to be selected.
-- **Score checkpoints on internal `val`, report on internal `test`.** `eval_vqgan_window.py`
-  defaults to `split=val`, which is also what a fine-tune selects on.
+Moved to `LESSONS.md`.
 
 # Known, not addressed
 
