@@ -27,6 +27,7 @@ bottleneck), then one diffusion run in its latent space.
 | Window recorded in every pickle | `geometry.hu_window`; loader refuses mixed-window concat |
 | Cohort-weighted sampling | `dataset.sample_shares`, `WeightedRandomSampler` in `Trainer` |
 | Per-cohort eval reporting | `eval_roundtrip.py`, `eval_reproj.py` |
+| Deduplicated, healthy-only eval pool | `train/build_eval_manifest.py` -> `eval_manifest.json`, `get_ddpm_dataset.eval_cases` |
 | Parameter-free HU metrics | `evaluation/hu_metrics.py` |
 | VQGAN scoring from NIfTI at any window | `train/eval_vqgan_window.py` |
 | Latent stats measurement | `train/measure_latent_stats.py` |

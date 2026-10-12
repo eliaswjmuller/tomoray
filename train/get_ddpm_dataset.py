@@ -10,6 +10,7 @@ import json
 import pickle
 
 import hydra
+import numpy as np
 import torch
 from torch.utils.data import Dataset, ConcatDataset
 
@@ -34,6 +35,7 @@ def folder_hu_window(folder):
 
 class BrainDRRDataset(Dataset):
     def __init__(self, folder, names, split=""):
+        self.folder = folder
         self.source = os.path.basename(os.path.normpath(folder))
         self.paths = [os.path.join(folder, n) for n in names
                       if os.path.exists(os.path.join(folder, n))]
@@ -102,6 +104,59 @@ def indices_by_source(concat_ds):
     for d in concat_ds.datasets:
         out.setdefault(getattr(d, "source", "?"), []).extend(range(off, off + len(d)))
         off += len(d)
+    return out
+
+
+MANIFEST = "eval_manifest.json"
+
+
+def eval_cases(cfg, splits=("val",), healthy_only=True):
+    """Evaluation pool: one entry per unique scan, optionally healthy only.
+
+    Internal folders hold byte-identical copies of a scan under different case tags,
+    so indexing a split directly double-counts and can pick a copy as the
+    wrong-patient donor. Needs eval_manifest.json (train/build_eval_manifest.py).
+    """
+    sets = dict(zip(("train", "val", "test"), get_dataset(cfg)))
+    out, seen = [], set()
+    for sp in splits:
+        for d in sets[sp].datasets:
+            if not d.paths:
+                continue
+            mpath = os.path.join(d.folder, MANIFEST)
+            if not os.path.exists(mpath):
+                raise FileNotFoundError(f"{mpath} missing: run train/build_eval_manifest.py")
+            with open(mpath) as f:
+                man = json.load(f)["entries"]
+            for i, p in enumerate(d.paths):
+                e = man.get(os.path.basename(p))
+                if e is None:
+                    raise KeyError(f"{p} not in {mpath}: manifest is stale, rebuild it")
+                if e["hash"] in seen or (healthy_only and not e["healthy"]):
+                    continue
+                seen.add(e["hash"])
+                out.append(dict(ds=d, i=i, src=d.source, name=os.path.basename(p),
+                                patient=e["patient"], healthy=e["healthy"]))
+    return out
+
+
+def pick_cases(pool, n_cases, seed=0):
+    """[(case, donor)] from an eval_cases pool: n_cases spread over each cohort
+    (<=0 -> all). The donor is a different PATIENT from the same cohort, so the swap
+    control isolates "wrong patient", not "wrong scanner" or "same scan, other tag".
+    """
+    rng = np.random.default_rng(seed)
+    by_src = {}
+    for c in pool:
+        by_src.setdefault(c["src"], []).append(c)
+    out = []
+    for src, cs in by_src.items():
+        if len({c["patient"] for c in cs}) < 2:
+            print(f"skip {src}: fewer than 2 patients in pool"); continue
+        k = len(cs) if n_cases <= 0 else min(n_cases, len(cs))
+        for t in np.linspace(0, len(cs) - 1, k).astype(int):
+            donors = [o for o in cs if o["patient"] != cs[t]["patient"]]
+            out.append((cs[t], donors[rng.integers(len(donors))]))
     return out
 
 

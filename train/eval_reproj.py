@@ -6,30 +6,31 @@ SAME renderer that made the training data and compares to the input DRRs.
 
 Conditions
   cfg0.0   -> pure null branch (prior only, conditioning ignored)  [FLOOR]
-  cfg1.0   -> plain conditional, no guidance
-  cfg1.5   -> guided
-  cfg2.0   -> guided, what training used
-  swap2.0  -> case i sampled with case (i+1)'s DRRs  [CONTROL]
+  cfgS     -> guided at scale S (+cfgs=[...])
+  swapS    -> case sampled with a DIFFERENT PATIENT's DRRs (same cohort)  [CONTROL]
 
-If cfg2.0 is not clearly better than cfg0.0 and swap2.0 on re-projection error,
-the model is a brain prior, not a reconstructor.
+Cases come from get_ddpm_dataset.eval_cases: one per unique scan (internal stores
+byte-identical copies under several tags), healthy only by default. Needs
+eval_manifest.json in each DRR folder (train/build_eval_manifest.py).
 
-Overrides: +milestone=149 +n_cases=8 +seed=0
+Overrides: +milestone=85 +n_cases=8 +seeds=[0,1,2] +splits=[val,test]
+           +healthy_only=true +cfgs=[0.0,2.0] +swap_cfg=2.0
+           +fusion_amp=fp32|bf16 +dpm_steps=250 +tag=name +outdir=dir
 """
 import os
 import sys
+from collections import Counter
 import torch
 import numpy as np
+import pandas as pd
 import hydra
+from torch.amp import autocast
 from omegaconf import DictConfig, open_dict
-from monai.data.meta_tensor import MetaTensor
-torch.serialization.add_safe_globals([MetaTensor])
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ddpm.diffusion import Unet3D, GaussianDiffusion
-from features_fusion.fusion import Fusion
-from get_ddpm_dataset import get_dataset, get_hu_window, indices_by_source
+from load_ddpm import load_ddpm
+from get_ddpm_dataset import get_hu_window, eval_cases, pick_cases
 from data.generate_drr_brain import render_views
 from evaluation.hu_metrics import to_hu, band_stats, CORE_LO, CORE_HI
 
@@ -37,49 +38,38 @@ from evaluation.hu_metrics import to_hu, band_stats, CORE_LO, CORE_HI
 @hydra.main(version_base=None, config_path="../config", config_name="base_cfg")
 def run(cfg: DictConfig):
     milestone = int(cfg.get("milestone", 149))
-    n_cases   = int(cfg.get("n_cases", 8))
-    seed      = int(cfg.get("seed", 0))
-    steps     = int(cfg.get("dpm_steps", 20))
+    n_cases   = int(cfg.get("n_cases", 8))              # per cohort; <=0 -> all
+    seeds     = [int(s) for s in cfg.get("seeds", [cfg.get("seed", 0)])]
+    steps     = int(cfg.get("dpm_steps", cfg.model.get("sampling_timesteps", 250)))
+    splits    = [str(s) for s in cfg.get("splits", ["val"])]
+    healthy   = bool(cfg.get("healthy_only", True))
+    cfgs      = [float(s) for s in cfg.get("cfgs", [0.0, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0])]
+    swap_cfg  = float(cfg.get("swap_cfg", 2.0))
+    # the encoder trained under bf16 autocast; fp32 is what offline evals always ran
+    fusion_amp = str(cfg.get("fusion_amp", "fp32"))
+    assert fusion_amp in ("fp32", "bf16"), fusion_amp
+    tag = str(cfg.get("tag", f"m{milestone}_{fusion_amp}_s{steps}"))
     with open_dict(cfg):
         cfg.model.results_folder = os.path.join(
             cfg.model.results_folder, cfg.dataset.name, cfg.model.name)
+    outdir = str(cfg.get("outdir", os.path.join(cfg.model.results_folder, "eval")))
+    os.makedirs(outdir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ls, ds_, ch = cfg.model.diffusion_img_size, cfg.model.diffusion_depth_size, \
-                  cfg.model.diffusion_num_channels
+    diffusion, fusion, step = load_ddpm(cfg, milestone, device)
     fz = cfg.model.fusion
 
-    fusion = Fusion(volume_shape=(ds_, ls, ls), vol_spacing=fz.vol_spacing,
-                    n_features=128, num_views=fz.num_views, total_deg=fz.total_deg,
-                    start_deg=fz.start_deg, endpoint=fz.endpoint, sdd=fz.sdd,
-                    sid=fz.sid, det_h=fz.det, det_w=fz.det, delx=fz.delx).to(device)
-    unet = Unet3D(dim=cfg.model.dim, dim_mults=cfg.model.dim_mults,
-                  channels=ch, cond_channels=128)
-    diffusion = GaussianDiffusion(
-        unet, vqgan_ckpt=cfg.model.vqgan_ckpt, image_size=ls, num_frames=ds_,
-        channels=ch, timesteps=cfg.model.timesteps, loss_type=cfg.model.loss_type,
-        latent_mean=cfg.model.latent_mean, latent_std=cfg.model.latent_std).to(device)
-
-    ck = os.path.join(cfg.model.results_folder, "checkpoints", f"sample-{milestone}.pt")
-    d = torch.load(ck, map_location=device, weights_only=False)
-    diffusion.load_state_dict(d["ema"]); fusion.load_state_dict(d["fusion"])
-    diffusion.eval(); fusion.eval()
-    print(f"loaded {ck}  step={d['step']}")
+    def fuse(p, a):
+        with torch.no_grad(), autocast(device, dtype=torch.bfloat16,
+                                       enabled=fusion_amp == "bf16"):
+            return fusion(p, a).float()
 
     win = get_hu_window(cfg)
-    _, val_ds, _ = get_dataset(cfg)
-    # n_cases PER COHORT; the swap donor is drawn from the SAME cohort so the control
-    # isolates "wrong patient", not "wrong scanner".
-    by_src = indices_by_source(val_ds)
-    cases, nxt, case_src = [], [], []
-    for src, idx in by_src.items():
-        k = min(n_cases, len(idx) - 1)
-        take = np.linspace(0, len(idx) - 2, k).astype(int)
-        cases += [idx[t] for t in take]
-        nxt += [idx[t + 1] for t in take]
-        case_src += [src] * k
-    print(f"cohorts: " + ", ".join(f"{k}={len(v)}" for k, v in by_src.items())
-          + f"  -> {len(cases)} cases ({n_cases}/cohort)")
+    pool = eval_cases(cfg, splits=splits, healthy_only=healthy)
+    cases = pick_cases(pool, n_cases)
+    print(f"pool ({'+'.join(splits)}, {'healthy' if healthy else 'all'}, unique scans): "
+          + ", ".join(f"{k}={v}" for k, v in Counter(c["src"] for c in pool).items())
+          + f"  -> {len(cases)} cases x {len(seeds)} seeds, {steps} steps, fusion {fusion_amp}")
 
     # CT voxel mm, NOT fz.vol_spacing (=4.0, the latent grid). The stored DRRs
     # carry vol_spacing=2.0; using 4.0 doubles the volume and breaks the geometry.
@@ -94,17 +84,11 @@ def run(cfg: DictConfig):
                                rp["device"])
         return torch.from_numpy(p)                        # (V,det,det) in [0,1]
 
-    conds = [("cfg0.0", 0.0, False), ("cfg1.0", 1.0, False),
-             ("cfg1.5", 1.5, False), ("cfg2.0", 2.0, False),
-             ("cfg2.5", 2.5, False), ("cfg3.0", 3.0, False),
-             ("cfg4.0", 4.0, False), ("swap2.0", 2.0, True)]
-    res = {k: {"vol": [], "rep": [], "bmae": [], "slope": [], "bias": [],
-           "cmae": [], "cslope": [], "cbias": [], "cresid": [],
-           "src": []} for k, _, _ in conds}
-    floor = []
+    conds = [(f"cfg{s:.1f}", s, False) for s in cfgs] + [(f"swap{swap_cfg:.1f}", swap_cfg, True)]
+    rows, floor = [], []
 
-    for c, (idx, jdx) in enumerate(zip(cases, nxt)):
-        it = val_ds[idx]
+    for ci, (c, dn) in enumerate(cases):
+        it = c["ds"][c["i"]]
         img = it["image"].unsqueeze(0).to(device)
         pin = it["projections"].unsqueeze(0).to(device)
         ang = it["angles"].unsqueeze(0).to(device)
@@ -112,111 +96,82 @@ def run(cfg: DictConfig):
         p_in = it["projections"][:, 0].float()             # (V,det,det) stored, [0,1]
 
         # renderer self-consistency: re-render the REAL volume -> floor
-        p_real = reproject(img.cpu(), angles_np)
-        f = (p_real - p_in).abs().mean().item()
+        f = (reproject(img.cpu(), angles_np) - p_in).abs().mean().item()
         floor.append(f)
 
         # band is selected on the REAL volume, so every condition is scored on the
         # same voxels and the comparison stays like-for-like
         real_hu = to_hu(img[0, 0].cpu().numpy(), *win)
 
-        it2 = val_ds[jdx]
-        pin2 = it2["projections"].unsqueeze(0).to(device)
-        ang2 = it2["angles"].unsqueeze(0).to(device)
+        it2 = dn["ds"][dn["i"]]
+        co_right = fuse(pin, ang)
+        co_swap = fuse(it2["projections"].unsqueeze(0).to(device),
+                       it2["angles"].unsqueeze(0).to(device))
 
-        line = [f"[{c+1}/{len(cases)}] {case_src[c]:<10} idx={idx:5d} floor={f:.4f}"]
+        line = [f"[{ci+1}/{len(cases)}] {c['src']:<10} {c['patient'][:12]:<12} floor={f:.4f}"]
         for name, cs, swap in conds:
-            with torch.no_grad():
-                co = fusion(pin2, ang2) if swap else fusion(pin, ang)
-                torch.manual_seed(seed)
-                g = diffusion.sample_dpm(cond=co, cond_scale=cs,
-                                         batch_size=1, steps=steps)
-            vmae = (g - img).abs().mean().item()
-            # always score against THIS case's real X-rays
-            rmae = (reproject(g.cpu(), angles_np) - p_in).abs().mean().item()
-            gen_hu = to_hu(g[0, 0].cpu().numpy(), *win)
-            st = band_stats(real_hu, gen_hu, win=win)
-            # CORE 20-40 = the arc's ranking metric (RUN_PLAN): strictly inside every
-            # candidate window, so it is comparable to the VQGAN ceiling (3.75 HU).
-            sc = band_stats(real_hu, gen_hu, lo=CORE_LO, hi=CORE_HI, win=win)
-            res[name]["vol"].append(vmae)
-            res[name]["rep"].append(rmae)
-            res[name]["bmae"].append(st["mae"])
-            res[name]["slope"].append(st["slope"])
-            res[name]["bias"].append(st["bias"])
-            res[name]["cmae"].append(sc["mae"])
-            res[name]["cslope"].append(sc["slope"])
-            res[name]["cbias"].append(sc["bias"])
-            res[name]["cresid"].append(sc["resid"])
-            res[name]["src"].append(case_src[c])
-            line.append(f"{name}: core={sc['mae']:.1f} a={sc['slope']:.2f} "
-                        f"rep={rmae:.4f}")
+            core = []
+            for seed in seeds:
+                with torch.no_grad():
+                    torch.manual_seed(seed)
+                    g = diffusion.sample_dpm(cond=co_swap if swap else co_right,
+                                             cond_scale=cs, batch_size=1, steps=steps)
+                gen_hu = to_hu(g[0, 0].cpu().numpy(), *win)
+                st = band_stats(real_hu, gen_hu, win=win)
+                # CORE 20-40 = the arc's ranking metric: strictly inside every
+                # candidate window, so it is comparable to the VQGAN ceiling
+                sc = band_stats(real_hu, gen_hu, lo=CORE_LO, hi=CORE_HI, win=win)
+                rows.append(dict(
+                    case=c["name"], patient=c["patient"], src=c["src"],
+                    donor=dn["patient"], seed=seed, cond=name, cfg=cs,
+                    vol_mae=(g - img).abs().mean().item(),
+                    # always score against THIS case's real X-rays
+                    reproj=(reproject(g.cpu(), angles_np) - p_in).abs().mean().item(),
+                    band_mae=st["mae"], band_slope=st["slope"], band_bias=st["bias"],
+                    band_resid=st["resid"], core_mae=sc["mae"], core_slope=sc["slope"],
+                    core_bias=sc["bias"], core_resid=sc["resid"]))
+                core.append(sc["mae"])
+            line.append(f"{name}: core={np.mean(core):.1f}")
         print("  ".join(line), flush=True)
 
-    print("\n" + "=" * 78)
-    print(f"RE-PROJECTION CONSISTENCY + ABLATION   n={n_cases}  step={d['step']}")
-    print("=" * 78)
-    print(f"{'condition':<10} {'band MAE':>10} {'slope a':>9} {'bias b':>9} "
-          f"{'reproj MAE':>18}   note")
-    fl = np.array(floor)
-    print(f"{'-- floor':<10} {'':>10} {'':>9} {'':>9} {fl.mean():>10.4f} +-{fl.std():.4f}   "
-          f"real volume re-rendered")
-    for name, _, _ in conds:
-        v = np.array(res[name]["vol"]); r = np.array(res[name]["rep"])
-        bm = np.array(res[name]["bmae"]); sl = np.array(res[name]["slope"])
-        bi = np.array(res[name]["bias"])
-        note = {"cfg0.0": "PRIOR ONLY (floor for conditioning)",
-                "swap2.0": "WRONG X-rays (control)",
-                "cfg2.0": "<- what training used"}.get(name, "")
-        print(f"{name:<10} {np.nanmean(bm):>8.2f}HU {np.nanmean(sl):>9.3f} "
-              f"{np.nanmean(bi):>+8.2f}HU {r.mean():>10.4f} +-{r.std():.4f}   {note}")
+    df = pd.DataFrame(rows)
+    csv = os.path.join(outdir, f"eval_{tag}.csv")
+    df.to_csv(csv, index=False)
 
-    print("\n" + "=" * 78)
-    print(f"CORE 20-40 HU (ranking metric; VQGAN ceiling = 3.75 HU internal)")
-    print("=" * 78)
-    print(f"{'condition':<10} {'core MAE':>10} {'slope a':>9} {'bias b':>9} "
-          f"{'resid s':>9}   note")
-    for name, _, _ in conds:
-        cm = np.array(res[name]["cmae"]); cs = np.array(res[name]["cslope"])
-        cb = np.array(res[name]["cbias"]); cr = np.array(res[name]["cresid"])
-        note = {"cfg0.0": "PRIOR ONLY (floor for conditioning)",
-                "swap2.0": "WRONG X-rays (control)",
-                "cfg2.0": "<- what training used"}.get(name, "")
-        print(f"{name:<10} {np.nanmean(cm):>8.2f}HU {np.nanmean(cs):>9.3f} "
-              f"{np.nanmean(cb):>+8.2f}HU {np.nanmean(cr):>8.2f}HU   {note}")
+    # seeds -> case means first, so every case weighs the same
+    pc = df.groupby(["src", "case", "cond"]).mean(numeric_only=True).reset_index()
+    sd = df.groupby(["src", "case", "cond"]).core_mae.std().groupby(["src", "cond"]).mean()
+    names = [n for n, _, _ in conds]
+    ref, ctl = f"cfg{swap_cfg:.1f}", f"swap{swap_cfg:.1f}"
 
-    print("\n" + "=" * 78)
-    print("PER COHORT   band 0-80 HU")
-    print("=" * 78)
-    srcs = list(dict.fromkeys(case_src))
-    print(f"{'condition':<10}" + "".join(f"{s2 + ' MAE':>16}" for s2 in srcs)
-          + "".join(f"{s2 + ' reproj':>16}" for s2 in srcs))
-    for name, _, _ in conds:
-        S = np.array(res[name]["src"])
-        bm = np.array(res[name]["bmae"]); r = np.array(res[name]["rep"])
-        row = f"{name:<10}"
-        for s2 in srcs:
-            row += f"{np.nanmean(bm[S == s2]):>13.2f}HU"
-        for s2 in srcs:
-            row += f"{np.nanmean(r[S == s2]):>16.4f}"
-        print(row)
-
-    b, p = np.array(res["cfg2.0"]["rep"]), np.array(res["cfg0.0"]["rep"])
-    s = np.array(res["swap2.0"]["rep"])
-    print(f"\n  conditional vs prior : {100*(p.mean()-b.mean())/p.mean():+.1f}% "
-          f"reproj error change")
-    print(f"  conditional vs swap  : {100*(s.mean()-b.mean())/s.mean():+.1f}%")
-    print(f"  headroom above floor : {b.mean()/max(fl.mean(),1e-9):.2f}x")
-
-    # THE GATE: does conditioning buy anything on PARENCHYMA, not on skull?
-    cb_ = np.nanmean(res["cfg2.0"]["cmae"]); cp_ = np.nanmean(res["cfg0.0"]["cmae"])
-    cs_ = np.nanmean(res["swap2.0"]["cmae"])
-    print(f"\n  CORE 20-40 conditioning margin")
-    print(f"    cfg2.0 vs prior only : {100*(cp_-cb_)/cp_:+.1f}%  "
-          f"({cp_:.2f} -> {cb_:.2f} HU)")
-    print(f"    cfg2.0 vs wrong Xray : {100*(cs_-cb_)/cs_:+.1f}%  "
-          f"({cs_:.2f} -> {cb_:.2f} HU)")
-    print("    ~0% on both => conditioning is inert on parenchyma in this window.")
+    print("\n" + "=" * 92)
+    print(f"step={step}  {steps} steps  fusion {fusion_amp}  seeds={seeds}  "
+          f"reproj floor {np.mean(floor):.4f}  -> {csv}")
+    for src in pc.src.unique():
+        s = pc[pc.src == src]
+        n = s.case.nunique()
+        print("=" * 92)
+        print(f"{src}  n={n} unique scans   CORE {CORE_LO}-{CORE_HI} HU  (mean over cases, "
+              f"seed sd = mean cross-seed sd)")
+        print(f"{'condition':<10} {'core MAE':>9} {'slope':>7} {'bias':>8} {'resid':>7} "
+              f"{'seed sd':>8} {'band MAE':>9} {'reproj':>8}")
+        for nm in names:
+            r = s[s.cond == nm]
+            print(f"{nm:<10} {r.core_mae.mean():>9.2f} {r.core_slope.mean():>7.3f} "
+                  f"{r.core_bias.mean():>+8.2f} {r.core_resid.mean():>7.2f} "
+                  f"{sd.get((src, nm), np.nan):>8.2f} {r.band_mae.mean():>9.2f} "
+                  f"{r.reproj.mean():>8.4f}")
+        if ref in names:
+            a = s[s.cond == ref].set_index("case")
+            for other, label in ((ctl, "wrong X-ray"), ("cfg0.0", "prior only")):
+                if other not in names:
+                    continue
+                b = s[s.cond == other].set_index("case").loc[a.index]
+                for col in ("core_mae", "band_mae"):
+                    m = 100 * (b[col] - a[col]) / b[col]       # paired, per case
+                    hw = 1.96 * m.std(ddof=1) / np.sqrt(len(m)) if len(m) > 1 else np.nan
+                    print(f"  {ref} vs {label:<11} {col[:4].upper()}: margin "
+                          f"{m.mean():+6.1f}% +-{hw:.1f} (95% CI, paired, n={len(m)})")
 
 
 if __name__ == "__main__":

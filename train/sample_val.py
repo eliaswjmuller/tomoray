@@ -6,7 +6,7 @@ loads the EMA weights, and renders one figure per val case:
   row 2 = ground-truth CT slices
   row 3 = generated slices at the same depths
 
-Overrides: +milestone=149 +n_cases=8 +cond_scale_s=3.0 +dpm_steps=20 +seed=0
+Overrides: +milestone=149 +n_cases=8 +cond_scale_s=3.0 +dpm_steps=250 +seed=0
 """
 import os
 import sys
@@ -15,15 +15,12 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from monai.data.meta_tensor import MetaTensor
-torch.serialization.add_safe_globals([MetaTensor])
 import hydra
 from omegaconf import DictConfig, open_dict
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ddpm.diffusion import Unet3D, GaussianDiffusion
-from features_fusion.fusion import Fusion
+from load_ddpm import load_ddpm
 from get_ddpm_dataset import get_dataset
 
 
@@ -33,7 +30,7 @@ def run(cfg: DictConfig):
     n_cases    = int(cfg.get("n_cases", 8))
     # +cond_scale_s= overrides; otherwise follow model.cond_scale
     cond_scale = float(cfg.get("cond_scale_s", cfg.model.cond_scale))
-    dpm_steps  = int(cfg.get("dpm_steps", 20))
+    dpm_steps  = int(cfg.get("dpm_steps", cfg.model.get("sampling_timesteps", 250)))
     seed       = int(cfg.get("seed", 0))
     outdir     = cfg.get("outdir", os.path.expanduser(
         f"~/Desktop/tomoray/val_showcase_m{milestone}_cfg{cond_scale}"))
@@ -45,39 +42,8 @@ def run(cfg: DictConfig):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(outdir, exist_ok=True)
 
-    latent_size     = cfg.model.diffusion_img_size
-    depth_size      = cfg.model.diffusion_depth_size
-    latent_channels = cfg.model.diffusion_num_channels
-    fusion_channels = 128
-    fz = cfg.model.fusion
-
-    fusion_model = Fusion(
-        volume_shape=(depth_size, latent_size, latent_size),
-        vol_spacing=fz.vol_spacing, n_features=fusion_channels,
-        num_views=fz.num_views, total_deg=fz.total_deg, start_deg=fz.start_deg,
-        endpoint=fz.endpoint, sdd=fz.sdd, sid=fz.sid,
-        det_h=fz.det, det_w=fz.det, delx=fz.delx,
-    ).to(device)
-
-    unet = Unet3D(dim=cfg.model.dim, dim_mults=cfg.model.dim_mults,
-                  channels=latent_channels, cond_channels=fusion_channels)
-
-    diffusion = GaussianDiffusion(
-        unet, vqgan_ckpt=cfg.model.vqgan_ckpt, image_size=latent_size,
-        num_frames=depth_size, channels=latent_channels,
-        timesteps=cfg.model.timesteps, loss_type=cfg.model.loss_type,
-        latent_mean=cfg.model.latent_mean, latent_std=cfg.model.latent_std,
-    ).to(device)
-
-    ckpt_path = os.path.join(cfg.model.results_folder, "checkpoints", f"sample-{milestone}.pt")
-    print(f"loading {ckpt_path}")
-    data = torch.load(ckpt_path, map_location=device, weights_only=False)
-    print(f"  checkpoint step = {data['step']}")
     # EMA weights, matching what the training previews sampled from
-    diffusion.load_state_dict(data["ema"])
-    fusion_model.load_state_dict(data["fusion"])
-    diffusion.eval()
-    fusion_model.eval()
+    diffusion, fusion_model, step = load_ddpm(cfg, milestone, device)
 
     _, val_dataset, _ = get_dataset(cfg)
     n_val = len(val_dataset)
@@ -145,7 +111,7 @@ def run(cfg: DictConfig):
             ax.set_title(f"Generated z={d}", fontsize=8); ax.axis("off")
 
         gm, gx = gen.min().item(), gen.max().item()
-        fig.suptitle(f"{name[:48]}   |  step {data['step']}  cfg={cond_scale}  "
+        fig.suptitle(f"{name[:48]}   |  step {step}  cfg={cond_scale}  "
                      f"{wtag}  gen range [{gm:+.2f},{gx:+.2f}]", fontsize=10)
         out = os.path.join(outdir, f"case{c:02d}_idx{idx}.png")
         fig.savefig(out, dpi=130, bbox_inches="tight")

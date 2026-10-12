@@ -1495,7 +1495,7 @@ class Trainer(object):
                 cond=test_cond, 
                 cond_scale=self.cond_scale,
                 batch_size=test_img.shape[0], 
-                steps=20
+                steps=int(self.cfg.model.get('sampling_timesteps', 250))
             )
 
             input1 = normalize_for_metrics(gen_test)
