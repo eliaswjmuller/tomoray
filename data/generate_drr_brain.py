@@ -89,9 +89,9 @@ def main():
     ap.add_argument("--render-hu-max", type=float, default=1000.0,
                     help="window the DRRs are rendered from")
     ap.add_argument("--num-views", type=int, default=5)
-    ap.add_argument("--total-deg", type=float, default=180.0)
+    ap.add_argument("--total-deg", type=float, default=120.0)
     ap.add_argument("--start-deg", type=float, default=0.0)
-    ap.add_argument("--endpoint", action="store_true")
+    ap.add_argument("--endpoint", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--sdd", type=float, default=1000.0)
     ap.add_argument("--sid", type=float, default=500.0)
     ap.add_argument("--det", type=int, default=256)

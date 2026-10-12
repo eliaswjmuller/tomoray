@@ -1,17 +1,17 @@
 name: brain_drr
 # Cone-beam DRR pickles from data/generate_drr_brain.py (each folder has splits.json).
 # RSNA clean+tilt + internal, patient-safe splits, concatenated.
-# Re-rendered 2026-08-26 at target window [0,80] (render window stays wide at
-# [-300,1000] so bone still attenuates). Head holder removed, matching how the
-# VQGAN was trained -- the previous 'internal' folder kept it and did not.
+# Target window [0,100], views 0-120 deg (re-rendered for the 2026-10 retarget; the
+# [0,80] / 0-144 deg sets are *_w0_80). Render window stays wide at [-300,1000] so
+# bone still attenuates. Head holder removed, matching how the VQGAN was trained.
 folders:
-  - /home/user/Desktop/tomoray/datasets/drr_brain/rsna_tilt_w0_80
-  - /home/user/Desktop/tomoray/datasets/drr_brain/internal_w0_80
+  - /home/user/Desktop/tomoray/datasets/drr_brain/rsna_tilt_w0_100_a0_120
+  - /home/user/Desktop/tomoray/datasets/drr_brain/internal_w0_100_a0_120
 
 # authoritative value is recorded in each pickle's geometry.hu_window;
 # these are the expected values, verified at load time
 hu_min: 0
-hu_max: 80
+hu_max: 100
 
 # Share of drawn training samples per cohort. Unlisted cohorts split the remainder in
 # proportion to their size. Uniform sampling would give internal 3.1% (436 of 14174),
@@ -20,4 +20,4 @@ hu_max: 80
 # same 436 volumes and invites memorisation.
 # DRR folder basenames: this key must follow it
 sample_shares:
-  internal_w0_80: 0.12
+  internal_w0_100_a0_120: 0.12

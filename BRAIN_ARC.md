@@ -1,7 +1,7 @@
 # Brain arc — goal
 
-1. **Task.** Reconstruct brain CT from **5 DRR views**, fixed spacing over a **180° arc**.
-2. **Target window.** Reconstruct **0–80 HU** — the soft-tissue (parenchyma) view is what we care about.
+1. **Task.** Reconstruct brain CT from **5 DRR views at 0/30/60/90/120°**, a medical requirement and not a tunable (until 2026-10-12: 0–144°, spread over 180°).
+2. **Target window.** Reconstruct **0–100 HU** (until 2026-10-12: 0–80) — the soft-tissue (parenchyma) view is what we care about.
 3. **Core problem.** The soft-tissue signal in the X-rays is **~40× weaker than bone** (~2% of the input).
 4. **Adjacent problem.** Domain transfer: not enough high-quality data (thinly sliced CTs - like internal data).
 

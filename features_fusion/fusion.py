@@ -16,7 +16,7 @@ class Fusion(nn.Module):
     """
 
     def __init__(self, volume_shape=(48, 64, 64), vol_spacing=4.0, n_features=128,
-                 num_views=5, total_deg=180.0, start_deg=0.0, endpoint=False,
+                 num_views=5, total_deg=120.0, start_deg=0.0, endpoint=True,
                  sdd=1000.0, sid=500.0, det_h=256, det_w=256, delx=3.0):
         super().__init__()
         self.volume_shape = tuple(volume_shape)

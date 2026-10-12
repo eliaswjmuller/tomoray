@@ -21,7 +21,7 @@ from omegaconf import DictConfig, open_dict
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from load_ddpm import load_ddpm
-from get_ddpm_dataset import get_dataset
+from get_ddpm_dataset import get_dataset, get_hu_window
 
 
 @hydra.main(version_base=None, config_path="../config", config_name="base_cfg")
@@ -53,10 +53,10 @@ def run(cfg: DictConfig):
     # spread across the concatenated val set so both cohorts are represented
     idxs = np.linspace(0, n_val - 1, n_cases).astype(int).tolist()
 
-    # Display window. The volume is [-1,1] over [-300,1000] HU; panels are drawn
+    # Display window. The volume is [-1,1] over the stored HU window; panels are drawn
     # in (v+1)/2 space, so convert the requested HU window into that domain.
     # win_hu=None -> full range (the original look).
-    HU_LO, HU_HI = -300.0, 1000.0
+    HU_LO, HU_HI = get_hu_window(cfg)
     win_lo = cfg.get("win_lo_hu", None)
     win_hi = cfg.get("win_hi_hu", None)
     if win_lo is not None and win_hi is not None:

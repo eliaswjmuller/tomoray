@@ -69,7 +69,12 @@ def get_hu_window(cfg):
             "source folders were rendered with different intensity windows: "
             + ", ".join(f"{f} -> {w}" for w, f in wins.items())
             + ". Re-render so they match.")
-    return next(iter(wins))
+    win = next(iter(wins))
+    want = (cfg.dataset.get("hu_min"), cfg.dataset.get("hu_max"))
+    if None not in want and tuple(map(float, want)) != win:
+        raise ValueError(f"pickles were rendered at {win} HU but cfg.dataset expects "
+                         f"{tuple(map(float, want))}; repoint folders or re-render.")
+    return win
 
 
 def get_dataset(cfg):

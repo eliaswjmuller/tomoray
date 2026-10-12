@@ -14,7 +14,7 @@ The CORE 20-40 HU band sits inside every candidate window, so it is the number t
 stays comparable when the window changes. That is what to rank variants on.
 
 Run:
-  python train/eval_vqgan_window.py model.vqgan_ckpt=/path/to.ckpt +hu_min=0 +hu_max=80
+  python train/eval_vqgan_window.py model.vqgan_ckpt=/path/to.ckpt +hu_min=0 +hu_max=100
   python train/eval_vqgan_window.py ... +n_cases=38 +split=val
 """
 import os
@@ -39,7 +39,7 @@ from evaluation.hu_metrics import to_hu, band_stats, BRAIN_LO, BRAIN_HI, CORE_LO
 @hydra.main(version_base=None, config_path="../config", config_name="base_cfg")
 def run(cfg: DictConfig):
     hu_min = float(cfg.get("hu_min", 0.0))
-    hu_max = float(cfg.get("hu_max", 80.0))
+    hu_max = float(cfg.get("hu_max", 100.0))
     n_cases = int(cfg.get("n_cases", 24))
     split = str(cfg.get("split", "val"))
     ss = tuple(int(s) for s in cfg.get("spatial_size", [128, 128, 96]))

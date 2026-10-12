@@ -19,7 +19,7 @@ from evaluation.hu_metrics import to_hu
 
 CKPT = sys.argv[1]
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 8
-HU_LO, HU_HI = 0.0, 80.0
+HU_LO, HU_HI = 0.0, 100.0
 SS = (128, 128, 96)
 COHORT = sys.argv[3] if len(sys.argv) > 3 else "internal"
 if COHORT == "internal":

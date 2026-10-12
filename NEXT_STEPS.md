@@ -1,7 +1,7 @@
 # TomoRay — next steps
 
-Goal: the best achievable brain-windowed ([0,80] HU) reconstruction from 5 sparse
-cone-beam DRRs, reported on the **internal** cohort. Scored on **CORE 20–40 HU** by
+Goal: the best achievable brain-windowed ([0,100] HU) reconstruction from 5 sparse
+cone-beam DRRs at 0/30/60/90/120°, reported on the **internal** cohort. Scored on **CORE 20–40 HU** by
 contrast recovery: slope, residual, and swap margin against wrong-patient X-rays. See
 `BRAIN_ARC.md` for targets, `RUN_PLAN.md` for run records, `LESSONS.md` for traps.
 
@@ -24,6 +24,50 @@ Consequences:
 - **The [0,80] window kept 50–80 HU for blood.** Healthy-only frees that range for GM/WM.
 
 ---
+
+## Retarget — [0,100] HU, views 0–120° (decided 2026-10-12)
+
+The window and the view angles both changed, so every artefact downstream of them is
+stale. That includes the VQGAN, the DRR sets, the latent stats and milestone 85.
+**The Stage 0 numbers below and every "warm-start from milestone 85" in this plan refer
+to the old [0,80] / 0–144° model.** Its milestones stay under the old run name.
+
+What changed:
+- **Window.** GM/WM contrast falls from 18.8% to 15% of the dynamic range, and 80–100 HU
+  is no longer saturated.
+- **Views.** The arc shrinks from 0–144° (spread over 180°) to 0–120°. This is a medical
+  requirement and is fixed. The 60° missing wedge it opens is part of the problem to
+  solve, not a setting to tune.
+- **Metrics.** CORE 20–40 and the 0–80 band remain comparable across runs. Absolute
+  re-projection numbers do not, because their floor moves.
+
+Code and configs are switched over. `ddpm.yaml` holds `???` for `vqgan_ckpt`,
+`latent_mean` and `latent_std`, so the DDPM cannot start on the stale values.
+
+1. **Render DRRs.** No VQGAN is needed: `RENDER_ONLY=1 bash run_ddpm_brain.sh`. This
+   writes `drr_brain/*_w0_100_a0_120` and their eval manifests, at ~2× the disk of the
+   `_w0_80` sets.
+2. **VQGAN at [0,100].** Warm-start from the frozen [0,80] `best-561`. This is the cheap
+   arm: the re-window is a linear map plus 20 HU of new headroom.
+   ```bash
+   bash run_finetune.sh dataset.hu_min=0 dataset.hu_max=100 model.max_epochs=800 \
+     model.finetune_from=/home/user/Desktop/tomoray/vqgan_runs/internal_w0_80_from_ep77__sp128x128x96/checkpoints/best-561-40464-0.0661.ckpt \
+     dataset.name=internal_w0_100_from_w0_80_ep561
+   ```
+   Select on internal val with
+   `python train/eval_vqgan_window.py +hu_min=0 +hu_max=100 +n_cases=38 model.vqgan_ckpt=<ckpt>`,
+   then report on `+split=test`.
+   - **Gate:** internal core MAE ≲ 4.0 HU (3.75 + checkpoint noise), with rsna core MAE
+     near 2.2.
+   - **If it misses:** re-window the RSNA pretrain (`rsna_w0_80_h16` best-77) at
+     [0,100], then repeat the internal fine-tune (RUN_PLAN Step 3).
+   - Stop on an observed plateau, not on the epoch count (`LESSONS.md`).
+3. **Fill in `ddpm.yaml`.** Set `vqgan_ckpt`, then run
+   `python train/measure_latent_stats.py +n_vols=48 model.vqgan_ckpt=<ckpt>` and paste
+   the stats.
+4. **Train.** `bash run_ddpm_brain.sh`. The DRRs already exist, so this goes straight to
+   training under the new run name.
+5. **Re-run Stage 0** on the new model before resuming Phase 0.
 
 ## Measured state (Stage 0, 2026-10-10)
 

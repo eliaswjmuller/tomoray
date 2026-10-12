@@ -21,7 +21,7 @@ CKPT = sys.argv[1]
 OUT = sys.argv[2]
 N = int(sys.argv[3]) if len(sys.argv) > 3 else 3
 SPLIT = sys.argv[4] if len(sys.argv) > 4 else "val"
-HU_LO, HU_HI = 0.0, 80.0
+HU_LO, HU_HI = 0.0, 100.0
 SS = (128, 128, 96)
 NIFTI = "/home/user/Desktop/tomoray/datasets/brain_dataset/CTs"
 

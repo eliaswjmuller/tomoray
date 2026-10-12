@@ -26,6 +26,7 @@ import numpy as np
 
 # defaults match the current ScaleIntensityRanged; pass explicitly when it changes
 WIN_LO, WIN_HI = -300.0, 1000.0
+# kept at 0-80 when the window widened to [0,100], so band numbers stay comparable
 BRAIN_LO, BRAIN_HI = 0.0, 80.0      # parenchyma, CSF and acute blood
 # Strictly inside every candidate window ([0,80], [0,100], [-50,150], [-300,1000]), so
 # it is never touched by saturation and stays comparable ACROSS windows. This is the
@@ -68,7 +69,7 @@ def band_stats(real_hu, gen_hu, lo=BRAIN_LO, hi=BRAIN_HI, win=None, sat_tol=1e-3
                 slope=slope, bias=bias, resid=resid)
 
 
-def hu_profile(real_hu, gen_hu, edges=(-1000, -300, -100, 0, 20, 40, 60, 80,
+def hu_profile(real_hu, gen_hu, edges=(-1000, -300, -100, 0, 20, 40, 60, 80, 100,
                                        150, 300, 700, 3000)):
     """MAE per ground-truth HU bin. Zero free parameters; bins are reporting
     granularity only. Shows where in the intensity range the error actually lives."""
