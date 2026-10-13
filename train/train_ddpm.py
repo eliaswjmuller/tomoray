@@ -67,6 +67,7 @@ def run(cfg: DictConfig):
         aggregate=fz.aggregate,
         supersample=fz.supersample,
         fp32=fz.fp32,
+        render_spacing=fz.render_spacing,
     )
     if accelerator.is_main_process:
         print("Initialization of 3D U-Net")

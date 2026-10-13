@@ -180,8 +180,12 @@ class VQGAN(pl.LightningModule):
 
         recon_loss = F.l1_loss(x_recon, x) * self.l1_weight
 
-        # Selects ALWAYS the middle slice
-        frame_idx = torch.full([B], D // 2, device=device).long()
+        # one axial slice per volume for LPIPS and the 2D discriminator: random in
+        # training (a fixed slice supervises one anatomical level), middle otherwise
+        if self.training and not log_image:
+            frame_idx = torch.randint(0, D, [B], device=device)
+        else:
+            frame_idx = torch.full([B], D // 2, device=device).long()
         frame_idx_selected = frame_idx.reshape(-1, 1, 1, 1, 1).repeat(1, C, 1, H, W)
         frames = torch.gather(x, 2, frame_idx_selected).squeeze(2)
         frames_recon = torch.gather(x_recon, 2, frame_idx_selected).squeeze(2)

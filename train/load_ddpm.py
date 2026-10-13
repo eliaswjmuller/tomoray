@@ -10,7 +10,8 @@ from features_fusion.fusion import Fusion
 
 
 def load_ddpm(cfg, milestone, device):
-    """Build the model as train_ddpm.py does and load sample-{milestone}.pt EMA weights.
+    """Build the model as train_ddpm.py does and load sample-{milestone}.pt EMA weights
+    (denoiser, and encoder when the checkpoint has one).
 
     Expects cfg.model.results_folder already joined with dataset/model name.
     Returns (diffusion, fusion, step), both in eval mode.
@@ -23,7 +24,7 @@ def load_ddpm(cfg, milestone, device):
                     start_deg=fz.start_deg, endpoint=fz.endpoint, sdd=fz.sdd,
                     sid=fz.sid, det_h=fz.det, det_w=fz.det, delx=fz.delx,
                     aggregate=fz.aggregate, supersample=fz.supersample,
-                    fp32=fz.fp32).to(device)
+                    fp32=fz.fp32, render_spacing=fz.render_spacing).to(device)
     unet = Unet3D(dim=cfg.model.dim, dim_mults=cfg.model.dim_mults,
                   channels=ch, cond_channels=fusion.out_channels,
                   full_3d=cfg.model.full_3d, cond_inject=cfg.model.cond_inject)
@@ -34,7 +35,9 @@ def load_ddpm(cfg, milestone, device):
 
     ck = os.path.join(cfg.model.results_folder, "checkpoints", f"sample-{milestone}.pt")
     d = torch.load(ck, map_location=device, weights_only=False)
-    diffusion.load_state_dict(d["ema"]); fusion.load_state_dict(d["fusion"])
+    # EMA encoder when the run kept one; older runs only saved the live encoder
+    enc = "ema_fusion" if "ema_fusion" in d else "fusion"
+    diffusion.load_state_dict(d["ema"]); fusion.load_state_dict(d[enc])
     diffusion.eval(); fusion.eval()
-    print(f"loaded {ck}  step={d['step']}", flush=True)
+    print(f"loaded {ck}  step={d['step']}  encoder={enc}", flush=True)
     return diffusion, fusion, d["step"]

@@ -5,7 +5,10 @@ Consistency is guaranteed by construction: both sides use diffDRR's own
 sampling grid for `num_views` fixed angles is constant, so it is built once.
 
 Convention (validated by round-trip phantom test): rotation about world z,
-which is the volume's FIRST spatial axis (d); h->y, w->x.
+which is the volume's FIRST spatial axis (d); h->y, w->x. diffDRR draws CT voxel i
+over [i, i+1], so the rendered content sits half a CT voxel past the centres used
+here; Fusion adds that offset (render_spacing). evaluation/check_fusion_alignment.py
+measures the residual.
 """
 import numpy as np
 import torch

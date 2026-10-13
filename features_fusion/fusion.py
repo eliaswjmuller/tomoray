@@ -23,13 +23,19 @@ class Fusion(nn.Module):
     finer detail, n=2 reads ~11 px and cuts that aliasing ~3x.
     fp32: run the whole module outside autocast; the GM/WM signal in the projections
     (~1e-3) is below the bf16 step.
+
+    render_spacing: CT voxel (mm) the DRRs were rendered at. diffDRR draws voxel i over
+    [i, i+1], half a voxel past the centre its affine gives it, on every axis; without
+    this the samples sit 1 mm (0.7 detector px) off. Stored as a buffer: a checkpoint
+    from before the correction loads with offset 0, its training grid.
     """
 
     def __init__(self, volume_shape=(48, 64, 64), vol_spacing=4.0, n_features=128,
                  num_views=5, total_deg=120.0, start_deg=0.0, endpoint=True,
                  sdd=1000.0, sid=500.0, det_h=256, det_w=256, delx=3.0, aggregate="mean",
-                 supersample=1, fp32=True):
+                 supersample=1, fp32=True, render_spacing=2.0):
         super().__init__()
+        self.register_buffer("render_offset_mm", torch.tensor(float(render_spacing) / 2))
         self.supersample = int(supersample)
         self.fp32 = fp32
         assert aggregate in ("mean", "concat"), aggregate
@@ -45,6 +51,11 @@ class Fusion(nn.Module):
         self.unet = Unet2d(n_channels=1, n_classes=n_features)
         self._grid = None  # (S, V, D, H, W, 2), S = supersample^3, cached per device
         self._angles_checked = False
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        state_dict.setdefault(prefix + "render_offset_mm", torch.tensor(0.0))   # pre-fix ckpt
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        self._grid = None
 
     def _check_angles(self, angles):
         """The grid is built from the CONFIG angles; the data carries its own. A
@@ -66,9 +77,10 @@ class Fusion(nn.Module):
             n = self.supersample
             sp = self.vol_spacing if hasattr(self.vol_spacing, "__len__") else (self.vol_spacing,) * 3
             frac = [(k + 0.5) / n - 0.5 for k in range(n)]      # sub-voxel centres, in voxels
+            o = self.render_offset_mm.item()
             self._grid = torch.stack([
                 self.geom.sampling_grid(self.volume_shape, self.vol_spacing, device,
-                                        offset_mm=(a * sp[0], b * sp[1], c * sp[2]))
+                                        offset_mm=(o + a * sp[0], o + b * sp[1], o + c * sp[2]))
                 for a in frac for b in frac for c in frac])
         return self._grid
 

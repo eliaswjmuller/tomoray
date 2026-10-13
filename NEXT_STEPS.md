@@ -44,6 +44,19 @@ What changed:
 Code and configs are switched over. `ddpm.yaml` holds `???` for `vqgan_ckpt`,
 `latent_mean` and `latent_std`, so the DDPM cannot start on the stale values.
 
+Pipeline fixes folded in before the first render (2026-10-13 architecture pass):
+- **Target = autoencoder data.** Both resample raw HU with anti-aliasing, then
+  window. Before, the autoencoder clipped first, which put a fake 50–99 HU rim at the
+  skull, and no anti-aliasing doubled target noise. The DRRs are unchanged: they keep
+  the old window-then-resample render volume.
+- **Back-projection 1 mm off.** diffDRR draws a voxel half a voxel past its affine
+  centre. Fusion now adds that offset; old checkpoints keep their uncorrected grid.
+  Check with `python evaluation/check_fusion_alignment.py`.
+- **EMA encoder,** LPIPS on a random slice, frozen autoencoder inside the DDPM, and the
+  RSNA subset default = the DRR subset.
+- Not done, needs a decision: physical voxel spacing instead of stretching each scan
+  to the box, and a direct-supervision head on the fused volume (item 19).
+
 1. **Render DRRs.** No VQGAN is needed: `RENDER_ONLY=1 bash run_ddpm_brain.sh`. This
    writes `drr_brain/*_w0_100_a0_120` and their eval manifests, at ~2× the disk of the
    `_w0_80` sets.
@@ -53,7 +66,8 @@ Code and configs are switched over. `ddpm.yaml` holds `???` for `vqgan_ckpt`,
    Instead the decoder trains on latents with added noise, so it tolerates a diffusion
    sample's error. Same latent shape. The training recipe is two-stage, as before:
    ```bash
-   bash run_vqgan.sh dataset.name=rsna_w0_100_cont_h16                 # RSNA, from scratch
+   bash run_vqgan.sh dataset.subset_csv=clean_subset_with_tilt.csv \
+     dataset.name=rsna_w0_100_cont_h16                               # RSNA, from scratch, = DRR subset
    bash run_finetune.sh dataset.name=internal_w0_100_cont \
      model.finetune_from=<rsna best ckpt> model.max_epochs=800
    ```
@@ -68,7 +82,7 @@ Code and configs are switched over. `ddpm.yaml` holds `???` for `vqgan_ckpt`,
    - Stop on an observed plateau, not on the epoch count (`LESSONS.md`).
 3. **Fill in `ddpm.yaml`.** Set `vqgan_ckpt`, then run
    `python train/measure_latent_stats.py +n_vols=48 model.vqgan_ckpt=<ckpt>` and paste
-   the stats.
+   the stats: the per-channel lists if the channel stds spread by more than ~2×.
 4. **Train.** `bash run_ddpm_brain.sh`. The DRRs already exist, so this goes straight to
    training under the new run name.
 5. **Re-run Stage 0** on the new model before resuming Phase 0.
@@ -129,7 +143,7 @@ Source: `eval/eval_stage0_m85_{fp32,bf16}.csv`.
 2. **EMA denoiser + raw encoder pairing. Falsified.** ε-loss probe over 5 pairings,
    t ∈ {100…900}, 19 internal + 10 RSNA scans: swap-gain within ~1 pt across pairings,
    and the current pairing is best or tied. EMA the encoder in future runs anyway; it
-   costs nothing.
+   costs nothing. (Done 2026-10-13.)
 3. **Absolute scale removed. Unlikely to matter.**
    - **Why:** the min/max normalisation divides by the maximum line integral, which is
      94±8 internal and 94±11 RSNA, so there is no cohort offset. A 10% input scale moves

@@ -34,6 +34,7 @@ fusion:
   det: 256
   delx: 3.0
   vol_spacing: 4.0          # latent voxel mm (2x the 2mm CT)
+  render_spacing: 2.0       # CT voxel mm the DRRs were rendered at (--vol-spacing)
   n_features: 128           # per view
   aggregate: concat         # mean -> 128 cond channels; concat -> 5 x 128 = 640
   supersample: 2            # 2^3 samples per 4 mm voxel (~2 mm); 1 = centre only

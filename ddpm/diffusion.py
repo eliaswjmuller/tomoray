@@ -747,12 +747,15 @@ class GaussianDiffusion(nn.Module):
 
         # Latent standardization. MUST match vqgan_ckpt: measured over 48 volumes of
         # the encoder output (quantize=False), train/measure_latent_stats.py.
-        self.latent_mean = latent_mean
-        self.latent_std = latent_std
+        # A scalar, or one value per latent channel.
+        as_num = lambda v: float(v) if isinstance(v, (int, float)) else [float(u) for u in v]
+        self.latent_mean = as_num(latent_mean)
+        self.latent_std = as_num(latent_std)
 
         if vqgan_ckpt:
             self.vqgan = VQGAN.load_from_checkpoint(vqgan_ckpt, weights_only=False)
-            self.vqgan.eval()
+            # frozen: keeps it out of DDP's gradient buckets and unused-parameter search
+            self.vqgan.eval().requires_grad_(False)
 
         else:
             self.vqgan = None
@@ -895,11 +898,18 @@ class GaussianDiffusion(nn.Module):
 
         return img
 
+    def latent_stats(self, ref):
+        """(mean, std) broadcastable against a (B, C, D, H, W) latent like `ref`."""
+        return tuple(torch.as_tensor(v, dtype=ref.dtype, device=ref.device).reshape(
+            (1, -1, 1, 1, 1) if isinstance(v, list) else ()) for v in (self.latent_mean, self.latent_std))
+
     def decode_latent(self, z):
         # standardized latent -> image. fp32: bf16 changes which code/grid value a
         # latent snaps to; snapping is a no-op for a continuous VQGAN
         with torch.autocast(z.device.type, enabled=False):
-            return self.vqgan.decode(z.float() * self.latent_std + self.latent_mean, quantize=True)
+            z = z.float()
+            mean, std = self.latent_stats(z)
+            return self.vqgan.decode(z * std + mean, quantize=True)
 
     @torch.inference_mode()
     def sample(self, cond=None, cond_scale=1., batch_size=1):
@@ -1006,7 +1016,8 @@ class GaussianDiffusion(nn.Module):
             with torch.no_grad(), torch.autocast(x.device.type, enabled=False):
                 x = self.vqgan.encode(x.float(), quantize=False)
                 # standardize to ~N(0,1), which is what the noise schedule assumes
-                x = (x - self.latent_mean) / self.latent_std
+                mean, std = self.latent_stats(x)
+                x = (x - mean) / std
         else:
             print("Hi")
             x = normalize_img(x)
@@ -1065,6 +1076,9 @@ class Trainer(object):
 
         self.ema = EMA(ema_decay)
         self.ema_model = copy.deepcopy(self.model).to(self.device)
+        # the encoder gets the same EMA, so samples pair an averaged denoiser with the
+        # encoder it was averaged alongside
+        self.ema_fusion = copy.deepcopy(self.fusion_model).to(self.device)
 
         self.update_ema_every = update_ema_every
 
@@ -1188,16 +1202,22 @@ class Trainer(object):
         Clipping only self.model left the Fusion grads unbounded."""
         return list(itertools.chain(self.model.parameters(), self.fusion_model.parameters()))
 
+    def unwrapped(self):
+        unwrap = self.accelerator.unwrap_model if self.accelerator else (lambda m: m)
+        return unwrap(self.model), unwrap(self.fusion_model)
+
     def reset_parameters(self):
-        unwrapped_model = self.accelerator.unwrap_model(self.model) if self.accelerator else self.model
-        self.ema_model.load_state_dict(unwrapped_model.state_dict())
+        model, fusion = self.unwrapped()
+        self.ema_model.load_state_dict(model.state_dict())
+        self.ema_fusion.load_state_dict(fusion.state_dict())
 
     def step_ema(self):
         if self.step < self.step_start_ema:
             self.reset_parameters()
             return
-        unwrapped_model = self.accelerator.unwrap_model(self.model) if self.accelerator else self.model
-        self.ema.update_model_average(self.ema_model, unwrapped_model)
+        model, fusion = self.unwrapped()
+        self.ema.update_model_average(self.ema_model, model)
+        self.ema.update_model_average(self.ema_fusion, fusion)
 
     def save(self, milestone):
 
@@ -1212,6 +1232,7 @@ class Trainer(object):
             'model': unwrapped_model.state_dict(),
             'fusion': unwrapped_fusion.state_dict(),
             'ema': self.ema_model.state_dict(),
+            'ema_fusion': self.ema_fusion.state_dict(),
             'opt': self.opt.state_dict(),   # without this a resume restarts Adam cold
             'scaler': self.scaler.state_dict()
         }
@@ -1250,6 +1271,11 @@ class Trainer(object):
         unwrapped_model.load_state_dict(data['model'])
         unwrapped_fusion.load_state_dict(data['fusion'])
         unwrapped_ema.load_state_dict(data['ema'])
+        if 'ema_fusion' in data:
+            self.ema_fusion.load_state_dict(data['ema_fusion'])
+        else:   # checkpoint from before the encoder had an EMA: start it at the live weights
+            print("checkpoint has no ema_fusion; EMA encoder starts from the live one")
+            self.ema_fusion.load_state_dict(data['fusion'])
 
         if 'opt' in data:
             self.opt.load_state_dict(data['opt'])
@@ -1406,7 +1432,7 @@ class Trainer(object):
 
             if self.step != 0 and self.step % self.save_and_sample_every == 0 and self.is_main:
                 self.ema_model.eval()
-                self.fusion_model.eval()
+                self.ema_fusion.eval()
 
                 with torch.no_grad():
 
@@ -1418,7 +1444,7 @@ class Trainer(object):
                         val_angles = val_batch["angles"].to(self.device)
 
                         with autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp):
-                            val_cond = self.fusion_model(val_xrays, val_angles)
+                            val_cond = self.ema_fusion(val_xrays, val_angles)
                             val_loss = self.ema_model(
                                 val_img,
                                 cond=val_cond,
@@ -1446,7 +1472,7 @@ class Trainer(object):
                     sample_angles = angles[:1]
                     real_img = img[:1]
                     
-                    sample_cond = self.fusion_model(sample_xrays, sample_angles)
+                    sample_cond = self.ema_fusion(sample_xrays, sample_angles)
 
                     all_samples = self.ema_model.sample_dpm(
                         cond=sample_cond,
@@ -1484,7 +1510,7 @@ class Trainer(object):
                     sample_angles_val = val_sample_batch["angles"][:1].to(self.device)
                     real_img_val = val_sample_batch["image"][:1].to(self.device)
 
-                    sample_cond_val = self.fusion_model(sample_xrays_val, sample_angles_val)
+                    sample_cond_val = self.ema_fusion(sample_xrays_val, sample_angles_val)
                     gen_val = self.ema_model.sample_dpm(
                         cond=sample_cond_val, cond_scale=self.cond_scale, batch_size=1, steps=20
                     )
@@ -1522,7 +1548,6 @@ class Trainer(object):
                         self.writer.add_image("Generated", gen_slice.unsqueeze(0), self.step)
                 
                 self.save(milestone)
-                self.fusion_model.train()
             
             self.step += 1
             
@@ -1534,7 +1559,7 @@ class Trainer(object):
 
         self.load(milestone)
         self.ema_model.eval()
-        self.fusion_model.eval()
+        self.ema_fusion.eval()
 
         if self.is_main:
             print(f"Loading test :")
@@ -1553,7 +1578,7 @@ class Trainer(object):
             test_angles = test_batch["angles"].to(self.device)
 
             with autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp):
-                test_cond = self.fusion_model(test_xrays, test_angles)
+                test_cond = self.ema_fusion(test_xrays, test_angles)
                 
                 test_loss = self.ema_model(
                     test_img,

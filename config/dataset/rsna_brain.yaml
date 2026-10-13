@@ -2,9 +2,10 @@ name: rsna2019_clean
 # RSNA reconstruction NIfTIs (output of the data/rsna_2019 pipeline).
 root_dir: /home/user/Desktop/tomoray/datasets/Brain_RSNA_2019/brain_rsna_2019/nifti
 
-# Ablation selector (relative to root_dir, or absolute). clean-only for now;
-# switch to clean_subset_with_tilt.csv for the +tilt comparison run.
-subset_csv: clean_subset.csv
+# Relative to root_dir, or absolute. Same subset as the DRRs (generate_drr_brain.py
+# PRESETS), so the autoencoder and the DDPM share one patient split.
+# clean_subset.csv is the no-tilt ablation.
+subset_csv: clean_subset_with_tilt.csv
 
 # ensure no patient wise train-test leakage - near dups
 split_by_patient: true

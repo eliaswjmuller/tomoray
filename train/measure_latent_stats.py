@@ -9,6 +9,10 @@ Re-measure after every VQGAN retrain, before launching the DDPM.
 Statistics are over the encoder output with quantize=False, which is what
 GaussianDiffusion encodes at training time (diffusion.py: vqgan.encode(..., quantize=False)).
 
+Also reports per-channel stats. A continuous latent has nothing that equalises its
+channels, and one global std gives a low-variance channel a lower SNR at every t; if
+the per-channel stds spread by more than ~2x, paste the per-channel lists instead.
+
 Run:  python train/measure_latent_stats.py +n_vols=48
       python train/measure_latent_stats.py +n_vols=48 model.vqgan_ckpt=/path/to.ckpt
 """
@@ -53,10 +57,17 @@ def run(cfg: DictConfig):
     mean = 0.0
     m2 = 0.0
     lo, hi = np.inf, -np.inf
+    cn_, cmean, cm2 = 0, 0.0, 0.0                     # per channel, same Welford update
     for c, i in enumerate(picks):
         x = train_ds[int(i)]["image"].unsqueeze(0).to(device)
         with torch.no_grad():
             h = vq.encode(x, quantize=False, include_embeddings=True)
+        hc = h[0].float().flatten(1).cpu().numpy().astype(np.float64)    # (C, D*H*W)
+        delta = hc.mean(1) - cmean
+        tot = cn_ + hc.shape[1]
+        cmean = cmean + delta * hc.shape[1] / tot
+        cm2 = cm2 + hc.var(1) * hc.shape[1] + delta ** 2 * cn_ * hc.shape[1] / tot
+        cn_ = tot
         v = h.float().flatten().cpu().numpy().astype(np.float64)
         lo, hi = min(lo, v.min()), max(hi, v.max())
         for chunk in np.array_split(v, 8):
@@ -77,7 +88,15 @@ def run(cfg: DictConfig):
     print(f"  latent_std:  {std:.4f}")
     print("=" * 60)
     print(f"  ({n:,} latent elements, range [{lo:.3f}, {hi:.3f}])")
-    print("\nPaste both into config/model/ddpm.yaml alongside the matching vqgan_ckpt.")
+    cstd = np.sqrt(cm2 / cn_)
+    print("\nper channel:")
+    for k, (m, sd) in enumerate(zip(cmean, cstd)):
+        print(f"  ch{k}: mean {m:+.4f}  std {sd:.4f}")
+    print(f"  std spread max/min: {cstd.max() / cstd.min():.2f}x")
+    print(f"  latent_mean: [{', '.join(f'{m:.4f}' for m in cmean)}]")
+    print(f"  latent_std:  [{', '.join(f'{sd:.4f}' for sd in cstd)}]")
+    print("\nPaste both into config/model/ddpm.yaml alongside the matching vqgan_ckpt: the")
+    print("scalars, or the per-channel lists if the std spread is above ~2x.")
 
 
 if __name__ == "__main__":
