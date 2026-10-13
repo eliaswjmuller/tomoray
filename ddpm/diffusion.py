@@ -35,7 +35,9 @@ from evaluation.dpm_solver_pytorch import NoiseScheduleVP, model_wrapper, DPM_So
 # helpers functions
 
 def normalize_for_metrics(x):
-    return (x - x.min()) / (x.max() - x.min() + 1e-8)
+    # fixed [-1,1] -> [0,1], as Metrics.update_metrics; a per-volume min-max would
+    # stretch a washed-out sample to full contrast and inflate PSNR/SSIM
+    return ((x + 1) / 2).clamp(0, 1)
 
 def exists(x):
     return x is not None
@@ -1216,7 +1218,7 @@ class Trainer(object):
         path = os.path.join(path_cp, f'sample-{milestone}.pt')
         torch.save(data, path)
 
-    def load(self, milestone, map_location=None, **kwargs):
+    def load(self, milestone, map_location=None):
         if milestone == -1:
             all_paths = os.listdir(os.path.join(self.results_folder, 'checkpoints'))
             all_milestones = [int((p.split('.')[0]).split("-")[-1]) for p in all_paths if p.endswith('.pt')]
@@ -1306,7 +1308,7 @@ class Trainer(object):
                     
                     cond = self.fusion_model(xrays, angles)
 
-                    if self.step % self.save_and_sample_every == 0 and self.is_main:
+                    if self.step % self.save_and_sample_every == 0 and self.is_main and i == 0:
 
                         debug_dir = self.results_folder / 'debug_fusion_maps'
                         debug_dir.mkdir(exist_ok=True)
@@ -1375,8 +1377,11 @@ class Trainer(object):
                 if grad_norm is None:
                     flag = torch.tensor(
                         [0.0 if torch.isfinite(loss) else 1.0], device=self.device)
-                    grad_norm = self.accelerator.reduce(flag, reduction="sum")
-                if not torch.isfinite(grad_norm).all():
+                    # a count of ranks with a non-finite loss: always finite itself
+                    bad = self.accelerator.reduce(flag, reduction="sum").item() > 0
+                else:
+                    bad = not torch.isfinite(grad_norm).all()
+                if bad:
                     if self.is_main:
                         print(f'{self.step}: non-finite loss/grad, step skipped '
                               f'(loss={loss.item()}, grad_norm={grad_norm})')

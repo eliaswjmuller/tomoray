@@ -26,15 +26,19 @@ from train.get_vqgan_dataset import get_dataset
 
 # PyTorch 2.6 flipped torch.load's weights_only default to True. Lightning's resume path
 # (trainer.fit(ckpt_path=...)) calls torch.load internally, so the flag cannot be passed
-# there, and our checkpoints carry the hydra cfg plus numpy/MetaTensor objects. These are
-# our own files; restore the old default. finetune_from already passes weights_only=False.
+# there, and our checkpoints carry the hydra cfg plus numpy/MetaTensor objects. Allow the
+# unsafe loader for our own .ckpt files only; anything else (e.g. the LPIPS VGG weights)
+# keeps the safe default. finetune_from already passes weights_only=False.
 _torch_load = torch.load
 
 
-def _torch_load_compat(*args, **kwargs):
-    # Lightning passes weights_only=True explicitly, so setdefault is not enough.
-    kwargs["weights_only"] = False
-    return _torch_load(*args, **kwargs)
+def _torch_load_compat(f, *args, **kwargs):
+    # Lightning hands over an open file object, so look through it for the path
+    name = str(f if isinstance(f, (str, os.PathLike)) else getattr(f, "path", getattr(f, "name", "")))
+    if name.endswith(".ckpt"):
+        # Lightning passes weights_only=True explicitly, so setdefault is not enough.
+        kwargs["weights_only"] = False
+    return _torch_load(f, *args, **kwargs)
 
 
 torch.load = _torch_load_compat

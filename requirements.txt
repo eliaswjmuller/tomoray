@@ -1,4 +1,5 @@
 accelerate
+diffdrr==0.5.1
 einops
 einops-exts
 hydra-core
@@ -9,10 +10,13 @@ monai
 nibabel
 numpy
 omegaconf
+pandas
 Pillow
+pydicom
 pytorch-lightning
 requests
 rotary-embedding-torch
+scipy
 SimpleITK
 torch
 torchvision
