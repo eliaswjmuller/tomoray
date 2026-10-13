@@ -87,7 +87,7 @@ def run(cfg: DictConfig):
             "subset_csv": str(cfg.dataset.get("subset_csv", None)),
             "spatial_size": list(cfg.dataset.spatial_size),
             "gpus": cfg.model.gpus, "batch_size": cfg.model.batch_size,
-            "n_codes": cfg.model.n_codes, "embedding_dim": cfg.model.embedding_dim,
+            "bottleneck": cfg.model.get("bottleneck", "vq"), "embedding_dim": cfg.model.embedding_dim,
             "n_hiddens": cfg.model.n_hiddens, "lr": cfg.model.lr,
             "max_epochs": cfg.model.max_epochs,
             "started": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -99,17 +99,18 @@ def run(cfg: DictConfig):
 
     # Fine-tuning: initialize weights from a pretrained checkpoint, then train FRESH
     # (new optimizer/epoch/step -- NOT a resume). Distinct from resume_from_checkpoint.
+    if OmegaConf.is_missing(cfg.model, "finetune_from"):   # .get() would return None and train from scratch
+        raise ValueError("model.finetune_from=??? -- pass the pretrained checkpoint")
     ft = cfg.model.get("finetune_from", None)
     if ft:
         ft = ft if os.path.isabs(ft) else hydra.utils.to_absolute_path(ft)
-        sd = torch.load(ft, map_location="cpu", weights_only=False)
-        sd = sd.get("state_dict", sd)
-        missing, unexpected = model.load_state_dict(sd, strict=False)
-        # CRITICAL: keep the pretrained codebook -- without this the first training
-        # batch would re-run _init_embeddings and overwrite it with a fresh init.
-        model.codebook._need_init = False
-        print(f"[finetune] loaded weights from {ft} | missing={len(missing)} unexpected={len(unexpected)} "
-              f"| codebook._need_init=False (pretrained codebook kept)")
+        ck = torch.load(ft, map_location="cpu", weights_only=False)
+        src_bn = ck.get("hyper_parameters", {}).get("model", {}).get("bottleneck", "vq")
+        if src_bn != model.bottleneck:
+            raise ValueError(f"finetune_from is a '{src_bn}' checkpoint, config says '{model.bottleneck}'")
+        # a loaded codebook is never re-initialised (Codebook._load_from_state_dict)
+        missing, unexpected = model.load_state_dict(ck.get("state_dict", ck), strict=False)
+        print(f"[finetune] loaded weights from {ft} | missing={len(missing)} unexpected={len(unexpected)}")
     callbacks = [
         # best models by reconstruction loss (the metric that tracks feature quality)
         ModelCheckpoint(

@@ -16,7 +16,7 @@ import torch.distributed as dist
 
 from vq_gan_3d.utils import shift_dim, adopt_weight, comp_getattr
 from vq_gan_3d.model.lpips import LPIPS
-from vq_gan_3d.model.codebook import Codebook
+from vq_gan_3d.model.codebook import Codebook, FSQ
 from omegaconf import OmegaConf
 
 def silu(x):
@@ -60,7 +60,10 @@ class VQGAN(pl.LightningModule):
 
         self.cfg = cfg
         self.embedding_dim = cfg.model.embedding_dim
-        self.n_codes = cfg.model.n_codes
+        # continuous: no quantizer, the decoder learns noisy latents | fsq | vq (checkpoints before 2026-10)
+        self.bottleneck = cfg.model.get("bottleneck", "vq")
+        assert self.bottleneck in ("continuous", "fsq", "vq"), self.bottleneck
+        self.latent_noise = float(cfg.model.get("latent_noise", 0.0))
 
         self.encoder = Encoder(cfg.model.n_hiddens, cfg.model.downsample,
                                cfg.dataset.image_channels, cfg.model.norm_type, cfg.model.padding_type,
@@ -78,8 +81,12 @@ class VQGAN(pl.LightningModule):
         self.post_vq_conv = SamePadConv3d(
             cfg.model.embedding_dim, self.enc_out_ch, 1)
 
-        self.codebook = Codebook(cfg.model.n_codes, cfg.model.embedding_dim,
-                                 no_random_restart=cfg.model.no_random_restart, restart_thres=cfg.model.restart_thres)
+        if self.bottleneck == "vq":
+            self.codebook = Codebook(cfg.model.n_codes, cfg.model.embedding_dim,
+                                     no_random_restart=cfg.model.no_random_restart, restart_thres=cfg.model.restart_thres)
+        elif self.bottleneck == "fsq":
+            assert len(cfg.model.fsq_levels) == cfg.model.embedding_dim, "one FSQ level per latent channel"
+            self.fsq = FSQ(list(cfg.model.fsq_levels))
 
         self.gan_feat_weight = cfg.model.gan_feat_weight
         # TODO: Changed batchnorm from sync to normal
@@ -110,23 +117,54 @@ class VQGAN(pl.LightningModule):
 
         return data.float()
     
+    def quantize(self, z):
+        """Pre-bottleneck z -> dict(embeddings=what the decoder sees, commitment_loss, perplexity)."""
+        if self.bottleneck == "vq":
+            return self.codebook(z)
+        if self.bottleneck == "fsq":
+            return self.fsq(z)
+        # continuous: per-sample noise U(0, latent_noise) x latent std, so the decoder
+        # tolerates the error a diffusion sample carries
+        if self.training and self.latent_noise > 0:
+            std = z.detach().flatten(1).std(dim=1).view(-1, 1, 1, 1, 1)
+            sigma = self.latent_noise * torch.rand_like(std) * std
+            z = z + sigma * torch.randn_like(z)
+        return dict(embeddings=z, commitment_loss=z.new_zeros(()), perplexity=None)
+
+    def snap(self, latent):
+        # diffusion-space latent -> the nearest value the decoder was trained on
+        if self.bottleneck == "vq":
+            return self.codebook.snap(latent)
+        if self.bottleneck == "fsq":
+            return self.fsq.snap(latent)
+        return latent
+
     def encode(self, x, include_embeddings=False, quantize=True):
+        """quantize=False returns the diffusion-space latent (FSQ: bounded, unrounded)."""
         h = self.pre_vq_conv(self.encoder(x))
-        if quantize:
-            vq_output = self.codebook(h)
-            if include_embeddings:
-                return vq_output['embeddings'], vq_output['encodings']
-            else:
-                return vq_output['encodings']
-        return h
-    
+        if self.bottleneck == "fsq":
+            h = self.fsq.bound(h)
+        if not quantize:
+            return h
+        if self.bottleneck != "vq":
+            return self.snap(h)
+        vq_output = self.codebook(h)
+        if include_embeddings:
+            return vq_output['embeddings'], vq_output['encodings']
+        return vq_output['encodings']
+
     def decode(self, latent, quantize=False):
-        if quantize:
-            vq_output = self.codebook(latent)
-            latent = vq_output['encodings']
-        h = F.embedding(latent, self.codebook.embeddings)
-        h = self.post_vq_conv(shift_dim(h, -1, 1))
-        return self.decoder(h)
+        """quantize=True snaps a diffusion-space latent first (VQ: nearest code, FSQ: grid,
+        continuous: no-op). VQ with quantize=False takes code INDICES, not a latent."""
+        if self.bottleneck == "vq" and not quantize:
+            h = shift_dim(F.embedding(latent, self.codebook.embeddings), -1, 1)
+        else:
+            h = self.snap(latent) if quantize else latent
+        return self.decoder(self.post_vq_conv(h))
+
+    def decode_continuous(self, latent):
+        # decoder on the latent as is, no snapping (for VQ/FSQ an off-grid input)
+        return self.decoder(self.post_vq_conv(latent))
 
 
     def forward(self, x, optimizer_idx=None, log_image=False, evaluation=False):
@@ -137,7 +175,7 @@ class VQGAN(pl.LightningModule):
 
         z = self.pre_vq_conv(self.encoder(x))
 
-        vq_output = self.codebook(z)
+        vq_output = self.quantize(z)
         x_recon = self.decoder(self.post_vq_conv(vq_output['embeddings']))
 
         recon_loss = F.l1_loss(x_recon, x) * self.l1_weight
@@ -210,10 +248,13 @@ class VQGAN(pl.LightningModule):
                      logger=True, on_step=True, on_epoch=True)
             self.log("train/aeloss", aeloss, prog_bar=True,
                      logger=True, on_step=True, on_epoch=True)
-            self.log("train/commitment_loss", vq_output['commitment_loss'],
-                     prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log('train/perplexity', vq_output['perplexity'],
-                     prog_bar=True, logger=True, on_step=True, on_epoch=True)
+            if self.bottleneck == "vq":
+                self.log("train/commitment_loss", vq_output['commitment_loss'],
+                         prog_bar=True, logger=True, on_step=True, on_epoch=True)
+            if vq_output['perplexity'] is not None:
+                self.log('train/perplexity', vq_output['perplexity'],
+                         prog_bar=True, logger=True, on_step=True, on_epoch=True)
+            self.log('train/latent_std', z.detach().float().std(), logger=True, on_step=True, on_epoch=True)
             return recon_loss, x_recon, vq_output, aeloss, perceptual_loss, gan_feat_loss
 
 
@@ -293,16 +334,17 @@ class VQGAN(pl.LightningModule):
         recon_loss, _, vq_output, perceptual_loss = self.forward(x)
         self.log('val/recon_loss', recon_loss, prog_bar=True, sync_dist=True)
         self.log('val/perceptual_loss', perceptual_loss, prog_bar=True, sync_dist=True)
-        self.log('val/perplexity', vq_output['perplexity'], prog_bar=True, sync_dist=True)
-        self.log('val/commitment_loss', vq_output['commitment_loss'], prog_bar=True, sync_dist=True)
+        if vq_output['perplexity'] is not None:
+            self.log('val/perplexity', vq_output['perplexity'], prog_bar=True, sync_dist=True)
+        if self.bottleneck == "vq":
+            self.log('val/commitment_loss', vq_output['commitment_loss'], prog_bar=True, sync_dist=True)
 
     def configure_optimizers(self):
         lr = self.cfg.model.lr
         opt_ae = torch.optim.Adam(list(self.encoder.parameters()) +
                                   list(self.decoder.parameters()) +
                                   list(self.pre_vq_conv.parameters()) +
-                                  list(self.post_vq_conv.parameters()) +
-                                  list(self.codebook.parameters()),
+                                  list(self.post_vq_conv.parameters()),   # codebook: buffers only (EMA)
                                   lr=lr, betas=(0.5, 0.9))
         opt_disc = torch.optim.Adam(list(self.image_discriminator.parameters()) +
                                     list(self.video_discriminator.parameters()),

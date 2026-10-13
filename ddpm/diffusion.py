@@ -746,9 +746,7 @@ class GaussianDiffusion(nn.Module):
         self.denoise_fn = denoise_fn
 
         # Latent standardization. MUST match vqgan_ckpt: measured over 48 volumes of
-        # the encoder output (quantize=False). The old codebook min/max normalization
-        # gave std 0.072 (13.9x too small) because only ~220 of 4096 codes are live --
-        # the dead ones sit far out in the tails and set the min/max.
+        # the encoder output (quantize=False), train/measure_latent_stats.py.
         self.latent_mean = latent_mean
         self.latent_std = latent_std
 
@@ -897,6 +895,12 @@ class GaussianDiffusion(nn.Module):
 
         return img
 
+    def decode_latent(self, z):
+        # standardized latent -> image. fp32: bf16 changes which code/grid value a
+        # latent snaps to; snapping is a no-op for a continuous VQGAN
+        with torch.autocast(z.device.type, enabled=False):
+            return self.vqgan.decode(z.float() * self.latent_std + self.latent_mean, quantize=True)
+
     @torch.inference_mode()
     def sample(self, cond=None, cond_scale=1., batch_size=1):
 
@@ -911,8 +915,7 @@ class GaussianDiffusion(nn.Module):
             (batch_size, channels, num_frames, image_size, image_size), cond=cond, cond_scale=cond_scale)
 
         if isinstance(self.vqgan, VQGAN):
-            _sample = _sample * self.latent_std + self.latent_mean
-            _sample = self.vqgan.decode(_sample, quantize=True)
+            _sample = self.decode_latent(_sample)
         else:
             unnormalize_img(_sample)
 
@@ -953,8 +956,7 @@ class GaussianDiffusion(nn.Module):
         )
 
         if isinstance(self.vqgan, VQGAN):
-            x_sample = x_sample * self.latent_std + self.latent_mean
-            x_sample = self.vqgan.decode(x_sample, quantize=True)
+            x_sample = self.decode_latent(x_sample)
         else:
             x_sample = unnormalize_img(x_sample)
 
@@ -1000,9 +1002,9 @@ class GaussianDiffusion(nn.Module):
         :param x: raw CT [B, 1, D, H, W]
         """
         if isinstance(self.vqgan, VQGAN):
-            with torch.no_grad():
-                x = self.vqgan.encode(
-                    x, quantize=False, include_embeddings=True)
+            # fp32 even inside the training autocast: the latent is the diffusion target
+            with torch.no_grad(), torch.autocast(x.device.type, enabled=False):
+                x = self.vqgan.encode(x.float(), quantize=False)
                 # standardize to ~N(0,1), which is what the noise schedule assumes
                 x = (x - self.latent_mean) / self.latent_std
         else:

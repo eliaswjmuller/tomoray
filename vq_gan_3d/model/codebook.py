@@ -47,20 +47,37 @@ class Codebook(pl.LightningModule):
         self.z_avg.data.copy_(_k_rand)
         self.N.data.copy_(torch.ones(self.n_codes))
 
+    def _load_from_state_dict(self, *args, **kwargs):
+        super()._load_from_state_dict(*args, **kwargs)
+        # loaded codes are never re-initialised (resume, fine-tune, inside the DDPM)
+        self._need_init = False
+
+    @torch.no_grad()
+    def nearest(self, flat_inputs, chunk=65536):
+        """fp32 argmin in token chunks: bf16 flips near-tied assignments, and the full
+        distance matrix (tokens x n_codes) was the training memory peak."""
+        e = self.embeddings.float()
+        e2 = (e ** 2).sum(dim=1)
+        return torch.cat([((c ** 2).sum(dim=1, keepdim=True) - 2 * c @ e.t() + e2).argmin(dim=1)
+                          for c in flat_inputs.split(chunk)])
+
+    def snap(self, z):
+        # z: [b, c, t, h, w] -> nearest code vectors, no codebook update
+        with torch.autocast(z.device.type, enabled=False):
+            idx = self.nearest(shift_dim(z.float(), 1, -1).flatten(end_dim=-2))
+            return shift_dim(F.embedding(idx.view(z.shape[0], *z.shape[2:]), self.embeddings), -1, 1)
+
     def forward(self, z):
+        with torch.autocast(z.device.type, enabled=False):
+            return self._forward(z.float())
+
+    def _forward(self, z):
         # z: [b, c, t, h, w]
         if self._need_init and self.training:
             self._init_embeddings(z)
         flat_inputs = shift_dim(z, 1, -1).flatten(end_dim=-2)  # [bthw, c]
-        distances = (flat_inputs ** 2).sum(dim=1, keepdim=True) \
-            - 2 * flat_inputs @ self.embeddings.t() \
-            + (self.embeddings.t() ** 2).sum(dim=0, keepdim=True)  # [bthw, c]
-
-        encoding_indices = torch.argmin(distances, dim=1)
-        encode_onehot = F.one_hot(encoding_indices, self.n_codes).type_as(
-            flat_inputs)  # [bthw, ncode]
-        encoding_indices = encoding_indices.view(
-            z.shape[0], *z.shape[2:])  # [b, t, h, w, ncode]
+        flat_idx = self.nearest(flat_inputs)
+        encoding_indices = flat_idx.view(z.shape[0], *z.shape[2:])  # [b, t, h, w]
 
         embeddings = F.embedding(
             encoding_indices, self.embeddings)  # [b, t, h, w, c]
@@ -68,16 +85,18 @@ class Codebook(pl.LightningModule):
 
         commitment_loss = 0.25 * F.mse_loss(z, embeddings.detach())
 
+        counts = torch.bincount(flat_idx, minlength=self.n_codes).float()  # [ncode]
+
         # EMA codebook update
         if self.training:
-            n_total = encode_onehot.sum(dim=0)
-            encode_sum = flat_inputs.t() @ encode_onehot
+            n_total = counts.clone()
+            encode_sum = torch.zeros_like(self.embeddings).index_add_(0, flat_idx, flat_inputs)  # [ncode, c]
             if dist.is_initialized():
                 dist.all_reduce(n_total)
                 dist.all_reduce(encode_sum)
 
             self.N.data.mul_(0.99).add_(n_total, alpha=0.01)
-            self.z_avg.data.mul_(0.99).add_(encode_sum.t(), alpha=0.01)
+            self.z_avg.data.mul_(0.99).add_(encode_sum, alpha=0.01)
 
             n = self.N.sum()
             weights = (self.N + 1e-7) / (n + self.n_codes * 1e-7) * n
@@ -96,8 +115,7 @@ class Codebook(pl.LightningModule):
 
         embeddings_st = (embeddings - z).detach() + z
 
-        avg_probs = torch.mean(encode_onehot.float(), dim=0)  #
-        avg_probs = avg_probs / avg_probs.sum()   #
+        avg_probs = counts / counts.sum()
         perplexity = torch.exp(-torch.sum(avg_probs *
                                torch.log(avg_probs + 1e-10)))
 
@@ -107,3 +125,39 @@ class Codebook(pl.LightningModule):
     def dictionary_lookup(self, encodings):
         embeddings = F.embedding(encodings, self.embeddings)
         return embeddings
+
+class FSQ(nn.Module):
+    """Finite scalar quantization (Mentzer et al. 2023): each channel is bounded to
+    [-1, 1] by tanh and rounded to `levels` evenly spaced values. The implicit codebook
+    is prod(levels) and every code is reachable, so nothing can collapse or die."""
+
+    def __init__(self, levels):
+        super().__init__()
+        assert all(l % 2 == 1 for l in levels), f"odd levels keep 0 on the grid: {levels}"
+        lv = torch.tensor(levels, dtype=torch.float64)
+        self.register_buffer('half_width', ((lv - 1) / 2).float(), persistent=False)
+        self.register_buffer('basis', torch.cumprod(torch.cat([lv.new_ones(1), lv[:-1]]), 0).long(),
+                             persistent=False)
+
+    def _h(self, z):
+        return self.half_width.view(1, -1, *([1] * (z.dim() - 2)))
+
+    def bound(self, z):
+        return torch.tanh(z.float())
+
+    def snap(self, zb):
+        # zb: bounded latent [b, c, t, h, w] -> nearest grid value per channel
+        h = self._h(zb)
+        return torch.round(zb.float().clamp(-1, 1) * h) / h
+
+    def forward(self, z):
+        with torch.autocast(z.device.type, enabled=False):
+            zb = self.bound(z)
+            q = self.snap(zb)
+            digits = (q * self._h(q) + self._h(q)).round().long()            # [b, c, t, h, w], 0..L-1
+            idx = (digits * self.basis.view(1, -1, *([1] * (z.dim() - 2)))).sum(1)
+            _, counts = idx.flatten().unique(return_counts=True)
+            p = counts.float() / counts.sum()
+            perplexity = torch.exp(-(p * torch.log(p)).sum())
+        return dict(embeddings=zb + (q - zb).detach(), encodings=idx,
+                    commitment_loss=zb.new_zeros(()), perplexity=perplexity)

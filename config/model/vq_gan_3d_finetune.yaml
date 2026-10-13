@@ -10,7 +10,7 @@ accumulate_grad_batches: 1
 default_root_dir: /home/user/Desktop/tomoray/vqgan_runs
 default_root_dir_postfix: ''
 resume_from_checkpoint:     # leave null; fine-tuning uses finetune_from (weights only)
-finetune_from: /home/user/Desktop/tomoray/vqgan_runs/vqgan_clean_tilt_best.ckpt
+finetune_from: ???            # RSNA pretrain with the same bottleneck (vq_gan_3d_brain)
 max_steps: -1
 max_epochs: 100
 precision: bf16-mixed
@@ -18,8 +18,11 @@ gradient_clip_val: 1.0
 save_every_n_steps: 2000
 check_val_every_n_epoch: 1
 
+bottleneck: continuous      # continuous | fsq | vq (vq = checkpoints before 2026-10)
+latent_noise: 0.1           # continuous: decoder sees + U(0, this) x latent std noise
+fsq_levels: [15, 15, 15, 15, 15, 15, 15, 15]   # fsq: odd grid levels, one per channel
 embedding_dim: 8
-n_codes: 4096
+n_codes: 4096               # vq only (and restart_thres, no_random_restart)
 n_hiddens: 16
 lr: 1e-5                    # lower than pretrain (3e-5) to adapt without forgetting
 downsample: [2, 2, 2]

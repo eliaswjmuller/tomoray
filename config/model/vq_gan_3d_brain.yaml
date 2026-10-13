@@ -1,6 +1,6 @@
 # 3D VQGAN feature extractor (from-scratch training recipe).
 seed: 1
-batch_size: 4               # per GPU; codebook distance matrices are the memory bottleneck
+batch_size: 4               # per GPU
 num_workers: 8
 name: vq_gan_3d
 gpus: 3                     # DDP device count (>1 uses DDP)
@@ -15,8 +15,11 @@ gradient_clip_val: 1.0
 save_every_n_steps: 5000
 check_val_every_n_epoch: 1
 
+bottleneck: continuous      # continuous | fsq | vq (vq = checkpoints before 2026-10)
+latent_noise: 0.1           # continuous: decoder sees + U(0, this) x latent std noise
+fsq_levels: [15, 15, 15, 15, 15, 15, 15, 15]   # fsq: odd grid levels, one per channel
 embedding_dim: 8
-n_codes: 4096
+n_codes: 4096               # vq only (and restart_thres, no_random_restart)
 n_hiddens: 16
 lr: 3e-5
 downsample: [2, 2, 2]

@@ -35,18 +35,19 @@ ds = VerseDataset(NIFTI, split="test", spatial_size=SS,
                   data_list=[names[t] for t in take], hu_min=HU_LO, hu_max=HU_HI)
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 vq = VQGAN.load_from_checkpoint(CKPT, weights_only=False).eval().to(dev)
-n_codes = vq.codebook.embeddings.shape[0]
+is_vq = vq.bottleneck == "vq"   # code usage only means something for a learned codebook
+n_codes = vq.codebook.embeddings.shape[0] if is_vq else 1
 
 used = torch.zeros(n_codes, dtype=torch.float64)
 rows = []
 for i in range(len(ds)):
     x = ds[i]["image"].unsqueeze(0).to(dev)
     with torch.no_grad():
-        h = vq.encode(x, quantize=False, include_embeddings=True)
-        vqo = vq.codebook(h)
+        h = vq.encode(x, quantize=False)
         r = vq.decode(h, quantize=True).clamp(-1, 1)
-    idx = vqo["encodings"].flatten().cpu()
-    used += torch.bincount(idx, minlength=n_codes).double()
+        if is_vq:
+            idx = vq.codebook(h)["encodings"].flatten().cpu()
+            used += torch.bincount(idx, minlength=n_codes).double()
 
     a = to_hu(x[0, 0].cpu().numpy(), HU_LO, HU_HI)
     b = to_hu(r[0, 0].cpu().numpy(), HU_LO, HU_HI)
@@ -77,6 +78,8 @@ for k, (ia, ib) in enumerate([(0, 1), (2, 3), (4, 5)]):
                                          r[:, ib].mean() / r[:, ia].mean()))
 print("\ncorr(input, recon) in parenchyma : %.3f" % r[:, 6].mean())
 print("residual std                     : %.2f HU" % r[:, 7].mean())
+if not is_vq:
+    sys.exit(0)
 print("\ncodebook: %d/%d codes used (%.1f%%)" % ((used > 0).sum(), n_codes,
                                                  100.0 * (used > 0).sum() / n_codes))
 p = used / used.sum()

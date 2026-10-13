@@ -13,9 +13,14 @@ the evaluation (evaluation/hu_metrics.py):
 The CORE 20-40 HU band sits inside every candidate window, so it is the number that
 stays comparable when the window changes. That is what to rank variants on.
 
+Robustness: +latent_noise=s adds s x (latent std) Gaussian noise before decoding,
+the size of a diffusion sample's error. Compare bottlenecks at s = 0, 0.05, 0.1, 0.2.
++snap=false decodes the latent as is (for VQ/FSQ, off the grid the decoder trained on).
+
 Run:
   python train/eval_vqgan_window.py model.vqgan_ckpt=/path/to.ckpt +hu_min=0 +hu_max=100
   python train/eval_vqgan_window.py ... +n_cases=38 +split=val
+  python train/eval_vqgan_window.py ... +latent_noise=0.1
 """
 import os
 import sys
@@ -43,10 +48,13 @@ def run(cfg: DictConfig):
     n_cases = int(cfg.get("n_cases", 24))
     split = str(cfg.get("split", "val"))
     ss = tuple(int(s) for s in cfg.get("spatial_size", [128, 128, 96]))
+    snap = bool(cfg.get("snap", True))
+    noise = float(cfg.get("latent_noise", 0.0))
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     vq = VQGAN.load_from_checkpoint(cfg.model.vqgan_ckpt, weights_only=False).eval().to(device)
-    print(f"vqgan  : {cfg.model.vqgan_ckpt}")
+    print(f"vqgan  : {cfg.model.vqgan_ckpt}  ({vq.bottleneck})")
+    print(f"decode : snap={snap}  latent_noise={noise} x latent std")
     print(f"window : [{hu_min:.0f}, {hu_max:.0f}] HU   split={split}  n={n_cases}/cohort\n")
 
     out = {}
@@ -63,8 +71,11 @@ def run(cfg: DictConfig):
         for i in range(len(ds)):
             x = ds[i]["image"].unsqueeze(0).to(device)
             with torch.no_grad():
-                h = vq.encode(x, quantize=False, include_embeddings=True)
-                r = vq.decode(h, quantize=True).clamp(-1, 1)
+                h = vq.encode(x, quantize=False)
+                if noise > 0:   # seeded per case, so variants see the same noise
+                    g = torch.Generator(device=device).manual_seed(i)
+                    h = h + noise * h.std() * torch.randn(h.shape, generator=g, device=device)
+                r = (vq.decode(h, quantize=True) if snap else vq.decode_continuous(h)).clamp(-1, 1)
             xh = to_hu(x[0, 0].cpu().numpy(), hu_min, hu_max)
             rh = to_hu(r[0, 0].cpu().numpy(), hu_min, hu_max)
             b = band_stats(xh, rh, BRAIN_LO, BRAIN_HI, win=(hu_min, hu_max))
@@ -76,7 +87,7 @@ def run(cfg: DictConfig):
         out[src] = np.array(rows, dtype=np.float64)
 
     print("\n" + "=" * 78)
-    print(f"VQGAN ROUND-TRIP @ [{hu_min:.0f},{hu_max:.0f}] HU")
+    print(f"VQGAN ROUND-TRIP @ [{hu_min:.0f},{hu_max:.0f}] HU  ({vq.bottleneck}, snap={snap}, noise={noise})")
     print("=" * 78)
     print(f"  {'cohort':<12} {'n':>4} | {'band MAE':>9} {'a':>6} {'bias':>8} "
           f"| {'CORE MAE':>9} {'a':>6} {'bias':>8} {'sigma':>8}")

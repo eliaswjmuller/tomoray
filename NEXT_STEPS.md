@@ -47,20 +47,24 @@ Code and configs are switched over. `ddpm.yaml` holds `???` for `vqgan_ckpt`,
 1. **Render DRRs.** No VQGAN is needed: `RENDER_ONLY=1 bash run_ddpm_brain.sh`. This
    writes `drr_brain/*_w0_100_a0_120` and their eval manifests, at ~2× the disk of the
    `_w0_80` sets.
-2. **VQGAN at [0,100].** Warm-start from the frozen [0,80] `best-561`. This is the cheap
-   arm: the re-window is a linear map plus 20 HU of new headroom.
+2. **Autoencoder at [0,100], continuous latent (decided 2026-10-13).** The VQ codebook
+   is the round-trip ceiling: ~220 of 4096 codes live, and snapping discards what the
+   diffusion already models continuously. `bottleneck: continuous` drops the quantizer.
+   Instead the decoder trains on latents with added noise, so it tolerates a diffusion
+   sample's error. Same latent shape. The training recipe is two-stage, as before:
    ```bash
-   bash run_finetune.sh dataset.hu_min=0 dataset.hu_max=100 model.max_epochs=800 \
-     model.finetune_from=/home/user/Desktop/tomoray/vqgan_runs/internal_w0_80_from_ep77__sp128x128x96/checkpoints/best-561-40464-0.0661.ckpt \
-     dataset.name=internal_w0_100_from_w0_80_ep561
+   bash run_vqgan.sh dataset.name=rsna_w0_100_cont_h16                 # RSNA, from scratch
+   bash run_finetune.sh dataset.name=internal_w0_100_cont \
+     model.finetune_from=<rsna best ckpt> model.max_epochs=800
    ```
-   Select on internal val with
-   `python train/eval_vqgan_window.py +hu_min=0 +hu_max=100 +n_cases=38 model.vqgan_ckpt=<ckpt>`,
-   then report on `+split=test`.
-   - **Gate:** internal core MAE ≲ 4.0 HU (3.75 + checkpoint noise), with rsna core MAE
-     near 2.2.
-   - **If it misses:** re-window the RSNA pretrain (`rsna_w0_80_h16` best-77) at
-     [0,100], then repeat the internal fine-tune (RUN_PLAN Step 3).
+   Select with `python train/eval_vqgan_window.py +hu_min=0 +hu_max=100 +n_cases=38
+   model.vqgan_ckpt=<ckpt>` at `+latent_noise=0` and `0.1`. Run the old VQ `best-561`
+   the same way as the reference.
+   - **Gate:** internal core MAE clearly below VQ's 3.75 HU at noise 0, and no worse
+     than VQ at noise 0.1.
+   - **If the noise arm fails:** retrain with `model.bottleneck=fsq`, which keeps a snap
+     step but has no codebook to collapse. `model.bottleneck=vq` is the old recipe, now
+     with fp32 code assignment.
    - Stop on an observed plateau, not on the epoch count (`LESSONS.md`).
 3. **Fill in `ddpm.yaml`.** Set `vqgan_ckpt`, then run
    `python train/measure_latent_stats.py +n_vols=48 model.vqgan_ckpt=<ckpt>` and paste
