@@ -205,12 +205,22 @@ class SinusoidalPosEmb(nn.Module):
         return emb
 
 
-def Upsample(dim):
+def Upsample(dim, full_3d=False):
+    if full_3d:
+        return nn.ConvTranspose3d(dim, dim, 4, 2, 1)
     return nn.ConvTranspose3d(dim, dim, (1, 4, 4), (1, 2, 2), (0, 1, 1))
 
 
-def Downsample(dim):
+def Downsample(dim, full_3d=False):
+    if full_3d:
+        return nn.Conv3d(dim, dim, 4, 2, 1)
     return nn.Conv3d(dim, dim, (1, 4, 4), (1, 2, 2), (0, 1, 1))
+
+
+def zero_module(m):
+    for p in m.parameters():
+        nn.init.zeros_(p)
+    return m
 
 
 class LayerNorm(nn.Module):
@@ -244,9 +254,10 @@ class Block(nn.Module):
 
     """
 
-    def __init__(self, dim, dim_out, groups=8):
+    def __init__(self, dim, dim_out, groups=8, full_3d=False):
         super().__init__()
-        self.proj = nn.Conv3d(dim, dim_out, (1, 3, 3), padding=(0, 1, 1))
+        k, p = (3, 1) if full_3d else ((1, 3, 3), (0, 1, 1))
+        self.proj = nn.Conv3d(dim, dim_out, k, padding=p)
         self.norm = nn.GroupNorm(groups, dim_out)
         self.act = nn.SiLU()
 
@@ -267,15 +278,15 @@ class ResnetBlock(nn.Module):
      ResnetBlock = 2* block + residual connection
     """
 
-    def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8):
+    def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8, full_3d=False):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.SiLU(),
             nn.Linear(time_emb_dim, dim_out * 2)
         ) if exists(time_emb_dim) else None
 
-        self.block1 = Block(dim, dim_out, groups=groups)
-        self.block2 = Block(dim_out, dim_out, groups=groups)
+        self.block1 = Block(dim, dim_out, groups=groups, full_3d=full_3d)
+        self.block2 = Block(dim_out, dim_out, groups=groups, full_3d=full_3d)
         self.res_conv = nn.Conv3d(
             dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
@@ -291,6 +302,34 @@ class ResnetBlock(nn.Module):
 
         h = self.block2(h)
         return h + self.res_conv(x)
+
+
+class CondPyramid(nn.Module):
+    """Encodes the fused X-ray volume and feeds it to every U-Net resolution.
+
+    Without it F enters once, through init_conv's single linear mix with the noisy
+    latent. Each output is a zero-initialised 1x1x1 projection, so at init the U-Net
+    computes exactly what it would without this module.
+    """
+
+    def __init__(self, cond_channels, hidden, level_dims, mid_dim, full_3d=False, groups=8):
+        super().__init__()
+        k, p, s = (3, 1, 2) if full_3d else ((1, 3, 3), (0, 1, 1), (1, 2, 2))
+        act = lambda: nn.Sequential(nn.GroupNorm(groups, hidden), nn.SiLU())
+        self.stem = nn.Sequential(nn.Conv3d(cond_channels, hidden, 1), act(),
+                                  nn.Conv3d(hidden, hidden, k, padding=p), act())
+        self.downs = nn.ModuleList([nn.Sequential(nn.Conv3d(hidden, hidden, k, stride=s, padding=p), act())
+                                    for _ in level_dims[1:]])
+        self.proj = nn.ModuleList([zero_module(nn.Conv3d(hidden, d, 1)) for d in level_dims])
+        self.proj_mid = zero_module(nn.Conv3d(hidden, mid_dim, 1))
+
+    def forward(self, cond):
+        c = self.stem(cond)
+        out = [self.proj[0](c)]
+        for down, proj in zip(self.downs, self.proj[1:]):
+            c = down(c)
+            out.append(proj(c))
+        return out, self.proj_mid(c)        # per down-level, and the bottleneck
 
 
 class SpatialLinearAttention(nn.Module):
@@ -442,9 +481,12 @@ class Unet3D(nn.Module):
         use_sparse_linear_attn=True,
         block_type='resnet',
         resnet_groups=8,
-        cond_drop_prob=0.2
+        cond_drop_prob=0.2,
+        full_3d=False,          # 3x3x3 convs, depth downsampled too, 3D attention at the bottleneck
+        cond_inject=False,      # CondPyramid: F into every resolution, zero-init
     ):
         super().__init__()
+        self.full_3d = full_3d
 
         # classifer free guidance
 
@@ -469,8 +511,9 @@ class Unet3D(nn.Module):
         concat_channels = channels + cond_channels
 
         init_padding = init_kernel_size // 2
-        self.init_conv = nn.Conv3d(concat_channels, init_dim, (1, init_kernel_size,
-                                   init_kernel_size), padding=(0, init_padding, init_padding)) # replace channels by concat_channels
+        init_depth = 3 if full_3d else 1
+        self.init_conv = nn.Conv3d(concat_channels, init_dim, (init_depth, init_kernel_size,
+                                   init_kernel_size), padding=(init_depth // 2, init_padding, init_padding))
 
         self.init_temporal_attn = Residual(
             PreNorm(init_dim, temporal_attn(init_dim)))
@@ -499,7 +542,7 @@ class Unet3D(nn.Module):
 
         # block type
 
-        block_klass = partial(ResnetBlock, groups=resnet_groups)
+        block_klass = partial(ResnetBlock, groups=resnet_groups, full_3d=full_3d)
         block_klass_cond = partial(block_klass, time_emb_dim=time_dim)  # replace cond_dim by time_dim
 
         # modules for all layers
@@ -513,18 +556,22 @@ class Unet3D(nn.Module):
                 Residual(PreNorm(dim_out, SpatialLinearAttention(
                     dim_out, heads=attn_heads))) if use_sparse_linear_attn else nn.Identity(),
                 Residual(PreNorm(dim_out, temporal_attn(dim_out))),
-                Downsample(dim_out) if not is_last else nn.Identity()
+                Downsample(dim_out, full_3d) if not is_last else nn.Identity()
             ]))
 
         mid_dim = dims[-1]
         self.mid_block1 = block_klass_cond(mid_dim, mid_dim)
 
-        spatial_attn = EinopsToAndFrom(
-            'b c f h w', 'b f (h w) c', Attention(mid_dim, heads=attn_heads))
-
-        self.mid_spatial_attn = Residual(PreNorm(mid_dim, spatial_attn))
-        self.mid_temporal_attn = Residual(
-            PreNorm(mid_dim, temporal_attn(mid_dim)))
+        if full_3d:
+            # bottleneck is small (6x8x8 = 384 tokens), so attend over the whole volume
+            self.mid_attn = Residual(PreNorm(mid_dim, EinopsToAndFrom(
+                'b c f h w', 'b (f h w) c', Attention(mid_dim, heads=attn_heads))))
+        else:
+            spatial_attn = EinopsToAndFrom(
+                'b c f h w', 'b f (h w) c', Attention(mid_dim, heads=attn_heads))
+            self.mid_spatial_attn = Residual(PreNorm(mid_dim, spatial_attn))
+            self.mid_temporal_attn = Residual(
+                PreNorm(mid_dim, temporal_attn(mid_dim)))
 
         self.mid_block2 = block_klass_cond(mid_dim, mid_dim)
 
@@ -537,8 +584,12 @@ class Unet3D(nn.Module):
                 Residual(PreNorm(dim_in, SpatialLinearAttention(
                     dim_in, heads=attn_heads))) if use_sparse_linear_attn else nn.Identity(),
                 Residual(PreNorm(dim_in, temporal_attn(dim_in))),
-                Upsample(dim_in) if not is_last else nn.Identity()
+                Upsample(dim_in, full_3d) if not is_last else nn.Identity()
             ]))
+
+        self.cond_pyramid = CondPyramid(
+            cond_channels, init_dim, [d for d, _ in in_out], mid_dim, full_3d,
+            groups=resnet_groups) if cond_inject else None
 
         out_dim = default(out_dim, channels)
         self.final_conv = nn.Sequential(
@@ -582,14 +633,20 @@ class Unet3D(nn.Module):
         focus_present_mask = default(focus_present_mask, lambda: prob_mask_like(
             (batch,), prob_focus_present, device=device))
         
-        time_rel_pos_bias = self.time_rel_pos_bias(x.shape[2], device=x.device)
+        biases = {}
+        def pos_bias(n):        # depth shrinks per level when full_3d
+            if n not in biases:
+                biases[n] = self.time_rel_pos_bias(n, device=device)
+            return biases[n]
 
 
         if cond is not None and cond_drop_prob > 0:
             mask = prob_mask_like((batch,), cond_drop_prob, device=device)
             mask = rearrange(mask, 'b -> b 1 1 1 1')
             cond = cond * (1 - mask.float())
-        
+
+        inject = self.cond_pyramid(cond) if (self.cond_pyramid is not None and cond is not None) else None
+
         # early fusion (concat with F_avg)
         if cond is not None:
             assert cond.shape[2:] == x.shape[2:], "Feature volume must match latent dimensions"
@@ -599,25 +656,32 @@ class Unet3D(nn.Module):
         x = self.init_conv(x)
         r = x.clone()
 
-        x = self.init_temporal_attn(x, pos_bias=time_rel_pos_bias)
+        x = self.init_temporal_attn(x, pos_bias=pos_bias(x.shape[2]))
 
         t = self.time_mlp(time) if exists(self.time_mlp) else None
         
         h = []
 
-        for block1, block2, spatial_attn, temporal_attn, downsample in self.downs:
+        for ind, (block1, block2, spatial_attn, temporal_attn, downsample) in enumerate(self.downs):
+            if inject is not None:
+                x = x + inject[0][ind]
             x = block1(x, t)
             x = block2(x, t)
             x = spatial_attn(x)
-            x = temporal_attn(x, pos_bias=time_rel_pos_bias,
+            x = temporal_attn(x, pos_bias=pos_bias(x.shape[2]),
                               focus_present_mask=focus_present_mask)
             h.append(x)
             x = downsample(x)
 
+        if inject is not None:
+            x = x + inject[1]
         x = self.mid_block1(x, t)
-        x = self.mid_spatial_attn(x)
-        x = self.mid_temporal_attn(
-            x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask)
+        if self.full_3d:
+            x = self.mid_attn(x)
+        else:
+            x = self.mid_spatial_attn(x)
+            x = self.mid_temporal_attn(
+                x, pos_bias=pos_bias(x.shape[2]), focus_present_mask=focus_present_mask)
         x = self.mid_block2(x, t)
 
         for block1, block2, spatial_attn, temporal_attn, upsample in self.ups:
@@ -625,7 +689,7 @@ class Unet3D(nn.Module):
             x = block1(x, t)
             x = block2(x, t)
             x = spatial_attn(x)
-            x = temporal_attn(x, pos_bias=time_rel_pos_bias,
+            x = temporal_attn(x, pos_bias=pos_bias(x.shape[2]),
                               focus_present_mask=focus_present_mask)
             x = upsample(x)
 

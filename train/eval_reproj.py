@@ -57,6 +57,7 @@ def run(cfg: DictConfig):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     diffusion, fusion, step = load_ddpm(cfg, milestone, device)
+    fusion.fp32 = fusion_amp == "fp32"
     fz = cfg.model.fusion
 
     def fuse(p, a):

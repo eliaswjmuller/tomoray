@@ -19,11 +19,14 @@ def load_ddpm(cfg, milestone, device):
                   cfg.model.diffusion_num_channels
     fz = cfg.model.fusion
     fusion = Fusion(volume_shape=(ds_, ls, ls), vol_spacing=fz.vol_spacing,
-                    n_features=128, num_views=fz.num_views, total_deg=fz.total_deg,
+                    n_features=fz.n_features, num_views=fz.num_views, total_deg=fz.total_deg,
                     start_deg=fz.start_deg, endpoint=fz.endpoint, sdd=fz.sdd,
-                    sid=fz.sid, det_h=fz.det, det_w=fz.det, delx=fz.delx).to(device)
+                    sid=fz.sid, det_h=fz.det, det_w=fz.det, delx=fz.delx,
+                    aggregate=fz.aggregate, supersample=fz.supersample,
+                    fp32=fz.fp32).to(device)
     unet = Unet3D(dim=cfg.model.dim, dim_mults=cfg.model.dim_mults,
-                  channels=ch, cond_channels=128)
+                  channels=ch, cond_channels=fusion.out_channels,
+                  full_3d=cfg.model.full_3d, cond_inject=cfg.model.cond_inject)
     diffusion = GaussianDiffusion(
         unet, vqgan_ckpt=cfg.model.vqgan_ckpt, image_size=ls, num_frames=ds_,
         channels=ch, timesteps=cfg.model.timesteps, loss_type=cfg.model.loss_type,

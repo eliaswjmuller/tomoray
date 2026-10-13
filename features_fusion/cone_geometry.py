@@ -51,8 +51,9 @@ class ConeBeamGeometry:
         self._dev = device
 
     @torch.no_grad()
-    def sampling_grid(self, vol_shape, vol_spacing, device):
-        """vol_shape=(D,H,W) latent grid; vol_spacing scalar or (sd,sh,sw) mm.
+    def sampling_grid(self, vol_shape, vol_spacing, device, offset_mm=(0.0, 0.0, 0.0)):
+        """vol_shape=(D,H,W) latent grid; vol_spacing scalar or (sd,sh,sw) mm;
+        offset_mm (d,h,w) shifts every sample point off the voxel centre.
         Returns (V, D, H, W, 2) normalized (col,row) grids for F.grid_sample.
 
         autocast is forced off: the grid is built lazily from inside the training
@@ -60,15 +61,16 @@ class ConeBeamGeometry:
         (and the bad grid is then cached for the whole run).
         """
         with torch.autocast(torch.device(device).type, enabled=False):
-            return self._sampling_grid(vol_shape, vol_spacing, device)
+            return self._sampling_grid(vol_shape, vol_spacing, device, offset_mm)
 
-    def _sampling_grid(self, vol_shape, vol_spacing, device):
+    def _sampling_grid(self, vol_shape, vol_spacing, device, offset_mm):
         self._ensure(device)
         D, H, W = vol_shape
         sp = vol_spacing if hasattr(vol_spacing, "__len__") else (vol_spacing,) * 3
-        dz = (torch.arange(D, device=device).float() - (D - 1) / 2) * sp[0]  # -> world z (rot axis)
-        hy = (torch.arange(H, device=device).float() - (H - 1) / 2) * sp[1]  # -> world y
-        wx = (torch.arange(W, device=device).float() - (W - 1) / 2) * sp[2]  # -> world x
+        od, oh, ow = offset_mm
+        dz = (torch.arange(D, device=device).float() - (D - 1) / 2) * sp[0] + od  # -> world z (rot axis)
+        hy = (torch.arange(H, device=device).float() - (H - 1) / 2) * sp[1] + oh  # -> world y
+        wx = (torch.arange(W, device=device).float() - (W - 1) / 2) * sp[2] + ow  # -> world x
         Z, Y, X = torch.meshgrid(dz, hy, wx, indexing="ij")
         P = torch.stack([X, Y, Z], dim=-1)  # world xyz, (D,H,W,3)
         grids = []

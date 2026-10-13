@@ -52,19 +52,21 @@ def run(cfg: DictConfig):
     latent_size = cfg.model.diffusion_img_size          # h = w (64)
     depth_size = cfg.model.diffusion_depth_size         # f (48, non-cubic)
     latent_channels = cfg.model.diffusion_num_channels
-    fusion_channels = 128
     fz = cfg.model.fusion
 
     fusion_model = Fusion(
         volume_shape=(depth_size, latent_size, latent_size),
         vol_spacing=fz.vol_spacing,
-        n_features=fusion_channels,
+        n_features=fz.n_features,
         num_views=fz.num_views,
         total_deg=fz.total_deg,
         start_deg=fz.start_deg,
         endpoint=fz.endpoint,
         sdd=fz.sdd, sid=fz.sid,
         det_h=fz.det, det_w=fz.det, delx=fz.delx,
+        aggregate=fz.aggregate,
+        supersample=fz.supersample,
+        fp32=fz.fp32,
     )
     if accelerator.is_main_process:
         print("Initialization of 3D U-Net")
@@ -73,7 +75,9 @@ def run(cfg: DictConfig):
         dim=cfg.model.dim,
         dim_mults=cfg.model.dim_mults,
         channels=latent_channels,
-        cond_channels=fusion_channels
+        cond_channels=fusion_model.out_channels,
+        full_3d=cfg.model.full_3d,
+        cond_inject=cfg.model.cond_inject,
     )
     if accelerator.is_main_process:
         print("Initialization of diffusion")

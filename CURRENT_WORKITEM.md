@@ -94,7 +94,7 @@ non-contrast, soft-tissue kernel, and site diversity.
 
 | Dataset | Healthy | Slice | Use |
 |---|---|---|---|
-| [CQ500](http://headctstudy.qure.ai/dataset) | ~222 with no finding from all 3 readers | 0.625 mm in many studies (count unverified) | Main training addition. Labels cover ICH, fracture and mass effect only, so QC visually. Pick soft kernel; de-tilt. |
+| [CQ500](http://headctstudy.qure.ai/dataset – https://academictorrents.com/details/47e9d8aab761e75fd0a81982fa62bddf3a173831) | ~222 with no finding from all 3 readers | 0.625 mm in many studies (count unverified) | Main training addition. Labels cover ICH, fracture and mass effect only, so QC visually. Pick soft kernel; de-tilt. |
 | [CERMEP-IDB-MRXFDG](https://www.biorxiv.org/content/10.1101/2020.12.15.422636v1.full) | 37 volunteers | 0.6×0.6×1.5 mm | External healthy test. Low-dose, so noisier. Access by request. |
 | [OASIS-3](https://sites.wustl.edu/oasisbrains/home/oasis-3/) | ~755 cognitively normal | unverified | Large normal pool if thin. Check headers. |
 | [SynthRAD2023](https://arxiv.org/pdf/2303.16320) brain | tumour patients | 1 mm | Defaced and masked; last resort. |

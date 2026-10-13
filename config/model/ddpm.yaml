@@ -1,4 +1,4 @@
-name: diffusion_brain_w0_100_cond_5view_a0_120_dim192
+name: diffusion_brain_w0_100_cond_5view_a0_120_3d_dim128
 diffusion: GaussianDiffusion
 denoising_fn: Unet3D
 
@@ -34,12 +34,18 @@ fusion:
   det: 256
   delx: 3.0
   vol_spacing: 4.0          # latent voxel mm (2x the 2mm CT)
+  n_features: 128           # per view
+  aggregate: concat         # mean -> 128 cond channels; concat -> 5 x 128 = 640
+  supersample: 2            # 2^3 samples per 4 mm voxel (~2 mm); 1 = centre only
+  fp32: true                # Fusion outside bf16 autocast
 
-dim: 192                    # ~298M-param U-Net; ~46GB/2-sample fp32, sized for 4x96GB
+dim: 128                    # full_3d + cond_inject: 390M params; was dim 192 / 298M pseudo-3D
 dim_mults: [1, 2, 4, 8]
+full_3d: true               # 3x3x3 convs, depth 48->24->12->6, 3D attention at the bottleneck
+cond_inject: true           # F into every U-Net resolution via zero-init projections
 
 
-batch_size: 2               # per GPU; dim=192 attention OOMs above ~3 on 96GB
+batch_size: 2               # per GPU; the ~3 OOM limit was dim192 pseudo-3D -- re-measure
 train_lr: 1e-4              # was 3e-4; grads are now 3x larger (accum double-divide fixed)
 train_num_steps: 100000   # plan says ~80k (flat from 70k; 70k->150k moved val 0.0018);
                           # 100k leaves headroom, and it can be stopped early
